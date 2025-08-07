@@ -1,736 +1,367 @@
 #!/usr/bin/env python3
 """
-enhanced_donor_scraper.py - AI Deep Research Version
-
-Enhanced donor research scraper that uses AI to orchestrate deep research
-and generates three focused reports:
-1. Summary table with key prospect information
-2. 2-page executive summary
-3. Full narrative donor report
-
-All reports are formatted specifically for IHS donor research.
+AI-Powered Deep Research Orchestrator with IHS Enhancements
+Complete executable script
 """
 
-import os
-import csv
 import json
-import argparse
-import requests
-import xml.etree.ElementTree as ET
-from docx import Document
-import time
+import asyncio
 from datetime import datetime
+import os
+from typing import Dict, List, Optional
+from openai import OpenAI
+import pandas as pd
+from collections import defaultdict
+import re
+import sys
+from dotenv import load_dotenv
 
-# Optional PDF conversion
-try:
-    import docx2pdf
-    DOCX2PDF_AVAILABLE = True
-except ImportError:
-    DOCX2PDF_AVAILABLE = False
+# Import your scraper class (adjust path as needed)
+# from donor_research_scraper import DonorResearchScraper
 
-# Google Scholar
-try:
-    from scholarly import scholarly
-    SCHOLARLY_AVAILABLE = True
-except ImportError:
-    SCHOLARLY_AVAILABLE = False
-
-# OpenAI for ChatGPT
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-
-# ——— CONFIGURATION & API KEYS ————————————————————————
-# 
-# SET YOUR OPENAI API KEY HERE:
-# Option 1: Set it directly in the code (not recommended for production)
-# OPENAI_API_KEY = "sk-your-api-key-here"
-#
-# Option 2: Set it as an environment variable (recommended)
-# In your terminal before running the script:
-# export OPENAI_API_KEY="sk-your-api-key-here"
-#
-# Option 3: Create a .env file in the same directory with:
-# OPENAI_API_KEY=sk-your-api-key-here
-
-# OpenAI Model Selection (choose based on your access):
-# - "gpt-4o" - Latest and most capable (if available)
-# - "gpt-4-turbo" - Good balance of capability and cost
-# - "gpt-4" - Original GPT-4 
-# - "gpt-3.5-turbo" - Faster and cheaper, but less capable
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
-
-# API Keys - Set these as environment variables or directly here
-OPENAI_API_KEY       = ""
-
-# Optional APIs - The AI will work around missing APIs
-WEALTHENGINE_API_KEY = os.getenv("WEALTHENGINE_API_KEY", "")
-IWAVE_API_KEY        = os.getenv("IWAVE_API_KEY", "")
-CLEARBIT_API_KEY     = os.getenv("CLEARBIT_API_KEY", "")
-PDL_API_KEY          = os.getenv("PDL_API_KEY", "")
-FEC_API_KEY          = os.getenv("FEC_API_KEY", "")
-OPENSECRETS_API_KEY  = os.getenv("OPENSECRETS_API_KEY", "")
-GOOGLE_API_KEY       = os.getenv("GOOGLE_API_KEY", "")
-GOOGLE_CSE_ID        = os.getenv("GOOGLE_CSE_ID", "")
-FOLLOWTHEMONEY_KEY   = os.getenv("FOLLOWTHEMONEY_API_KEY", "")
-GUIDESTAR_API_KEY    = os.getenv("GUIDESTAR_API_KEY", "")
-FOUNDATION_CENTER_KEY = os.getenv("FOUNDATION_CENTER_API_KEY", "")
-DEBOUNCE_API_KEY     = os.getenv("DEBOUNCE_API_KEY", "")
-INTELIUS_API_KEY     = os.getenv("INTELIUS_API_KEY", "")
-RELSCI_API_KEY       = os.getenv("RELSCI_API_KEY", "")
-ROCKETREACH_API_KEY  = os.getenv("ROCKETREACH_API_KEY", "")
-WEALTHX_API_KEY      = os.getenv("WEALTHX_API_KEY", "")
-WINDFALL_API_KEY     = os.getenv("WINDFALL_API_KEY", "")
-LEXISNEXIS_API_KEY   = os.getenv("LEXISNEXIS_API_KEY", "")
-PACER_API_KEY        = os.getenv("PACER_API_KEY", "")
-PITCHBOOK_API_KEY    = os.getenv("PITCHBOOK_API_KEY", "")
-
-IRS_INDEX_URL_TEMPLATE = "https://s3.amazonaws.com/irs-form-990/index_{year}.json"
-
-# ——— AI DEEP RESEARCH ORCHESTRATOR ————————————————————————————
 class AIDeepResearchOrchestrator:
-    """AI-powered orchestrator that intelligently searches across all databases"""
+    """
+    AI-powered orchestrator that intelligently sequences searches across multiple sources
+    Enhanced for IHS donor research following Beth Miller standard
+    """
     
-    def __init__(self, scraper_instance):
-        self.scraper = scraper_instance
-        if not OPENAI_API_KEY:
-            raise ValueError("OpenAI API key required for AI orchestration. Set OPENAI_API_KEY environment variable.")
-        self.client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        # Try to use the configured model
-        self.model = OPENAI_MODEL
+    def __init__(self, scraper, openai_api_key):
+        self.scraper = scraper
+        self.client = OpenAI(api_key=openai_api_key)
+        self.model = "gpt-4"
         
-        # Test the model with a simple request
-        try:
-            test_response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": "test"}],
-                max_tokens=10
-            )
-            print(f"✓ Using OpenAI model: {self.model}")
-        except Exception as e:
-            if "model" in str(e).lower():
-                # Fallback to gpt-3.5-turbo if configured model isn't available
-                print(f"  ⚠️  {self.model} not available, using gpt-3.5-turbo")
-                self.model = "gpt-3.5-turbo"
-            else:
-                raise e
-        
-        # Map all available search methods
+        # Available search methods organized by data source
         self.available_searches = {
-            "wealth_screening": {
-                "wealthengine": {
-                    "method": self.scraper.search_wealthengine,
-                    "params": ["first", "last", "email", "city", "state"],
-                    "requires_key": bool(WEALTHENGINE_API_KEY),
-                    "description": "Net worth and gift capacity estimates"
-                },
-                "iwave": {
-                    "method": self.scraper.search_iwave,
+            "search_engines": {
+                "google": {
+                    "method": self.scraper.search_google,
                     "params": ["first", "last", "city", "state"],
-                    "requires_key": bool(IWAVE_API_KEY),
-                    "description": "Philanthropy score and wealth indicators"
+                    "requires_key": True,
+                    "description": "General Google search"
                 },
-                "wealthx": {
-                    "method": self.scraper.search_wealthx,
-                    "params": ["first", "last"],
-                    "requires_key": bool(WEALTHX_API_KEY),
-                    "description": "Ultra high net worth intelligence"
-                },
-                "windfall": {
-                    "method": self.scraper.search_windfall,
-                    "params": ["first", "last"],
-                    "requires_key": bool(WINDFALL_API_KEY),
-                    "description": "Wealth screening and estimates"
+                "bing": {
+                    "method": self.scraper.search_bing,
+                    "params": ["first", "last", "city", "state"],
+                    "requires_key": True,
+                    "description": "Bing search results"
                 }
             },
-            "contact_enrichment": {
-                "clearbit": {
-                    "method": self.scraper.search_clearbit,
-                    "params": ["email"],
-                    "requires_key": bool(CLEARBIT_API_KEY),
-                    "description": "Professional and social profiles from email"
+            "people_data": {
+                "apollo": {
+                    "method": self.scraper.search_apollo,
+                    "params": ["first", "last", "city", "state"],
+                    "requires_key": True,
+                    "description": "Apollo business contacts and employment"
                 },
                 "pdl": {
                     "method": self.scraper.search_pdl,
-                    "params": ["email", "first", "last", "city", "state"],
-                    "requires_key": bool(PDL_API_KEY),
-                    "description": "Comprehensive people data"
+                    "params": ["first", "last", "city", "state"],
+                    "requires_key": True,
+                    "description": "People Data Labs comprehensive profiles"
                 },
-                "rocketreach": {
-                    "method": self.scraper.search_rocketreach,
-                    "params": ["first", "last", "company"],
-                    "requires_key": bool(ROCKETREACH_API_KEY),
-                    "description": "Email and phone discovery"
-                },
-                "debounce": {
-                    "method": self.scraper.validate_email_debounce,
-                    "params": ["email"],
-                    "requires_key": bool(DEBOUNCE_API_KEY),
-                    "description": "Email validation"
+                "linkedin": {
+                    "method": self.scraper.search_linkedin,
+                    "params": ["first", "last", "city", "state"],
+                    "requires_key": True,
+                    "description": "LinkedIn professional profile"
                 }
             },
-            "political_giving": {
+            "financial": {
                 "fec": {
                     "method": self.scraper.search_fec,
-                    "params": ["first", "last", "state", "city", "zip_code"],
-                    "requires_key": bool(FEC_API_KEY),
-                    "description": "Federal campaign contributions"
+                    "params": ["first", "last", "city", "state"],
+                    "requires_key": False,
+                    "description": "Federal Election Commission political contributions"
                 },
                 "opensecrets": {
                     "method": self.scraper.search_opensecrets,
                     "params": ["first", "last"],
-                    "requires_key": bool(OPENSECRETS_API_KEY),
-                    "description": "Political giving summaries and analysis"
+                    "requires_key": True,
+                    "description": "OpenSecrets political donation summaries"
                 },
-                "followthemoney": {
-                    "method": self.scraper.search_followthemoney,
-                    "params": ["first", "last", "state"],
-                    "requires_key": bool(FOLLOWTHEMONEY_KEY),
-                    "description": "State and local campaign finance"
+                "sec": {
+                    "method": self.scraper.search_sec,
+                    "params": ["first", "last"],
+                    "requires_key": False,
+                    "description": "SEC insider trading and holdings"
                 }
             },
-            "nonprofit_philanthropy": {
+            "property": {
+                "property_appraiser": {
+                    "method": self.scraper.search_property_appraiser,
+                    "params": ["first", "last", "city", "state"],
+                    "requires_key": False,
+                    "description": "Property ownership records"
+                }
+            },
+            "nonprofits": {
                 "irs_990": {
-                    "method": self.scraper.find_irs_filings,
-                    "params": ["first", "last", "city", "state"],
-                    "requires_key": True,  # Always available
-                    "description": "IRS Form 990 filings and nonprofit affiliations"
-                },
-                "guidestar": {
-                    "method": self.scraper.search_guidestar,
+                    "method": self.scraper.search_irs_990,
                     "params": ["first", "last"],
-                    "requires_key": bool(GUIDESTAR_API_KEY),
-                    "description": "Comprehensive nonprofit data"
-                },
-                "foundation_center": {
-                    "method": self.scraper.search_foundation_center,
-                    "params": ["first", "last"],
-                    "requires_key": bool(FOUNDATION_CENTER_KEY),
-                    "description": "Foundation grants and giving"
-                },
-                "propublica_nonprofit": {
-                    "method": self.scraper.search_propublica_nonprofit,
-                    "params": ["first", "last", "city", "state"],
-                    "requires_key": True,  # Always available
-                    "description": "ProPublica nonprofit explorer"
+                    "requires_key": False,
+                    "description": "IRS 990 nonprofit filings"
                 }
             },
-            "business_wealth": {
-                "sec_edgar": {
-                    "method": self.scraper.search_sec_edgar,
-                    "params": ["first", "last"],
-                    "requires_key": True,  # Always available
-                    "description": "SEC filings, insider trading, company ownership"
+            # IHS-specific search categories
+            "personal_network": {
+                "spouse_partner": {
+                    "method": self.scraper.search_spouse_partner,
+                    "params": ["first", "last", "city", "state"],
+                    "requires_key": True,
+                    "description": "Deep search for spouse/partner - marriage records, business connections, own wealth"
                 },
-                "pitchbook": {
-                    "method": self.scraper.search_pitchbook,
-                    "params": ["first", "last"],
-                    "requires_key": bool(PITCHBOOK_API_KEY),
-                    "description": "VC, PE, and M&A activity"
+                "college_connections": {
+                    "method": self.scraper.search_college_connections,
+                    "params": ["first", "last", "college", "grad_year"],
+                    "requires_key": True,
+                    "description": "Find roommates, Greek life, clubs, classmates now in power positions"
                 },
-                "relsci": {
-                    "method": self.scraper.search_relsci,
-                    "params": ["first", "last"],
-                    "requires_key": bool(RELSCI_API_KEY),
-                    "description": "Professional relationships and board positions"
+                "social_clubs": {
+                    "method": self.scraper.search_social_clubs,
+                    "params": ["first", "last", "city"],
+                    "requires_key": True,
+                    "description": "Country clubs, YPO/WPO, civic organizations"
                 }
             },
-            "public_records": {
-                "lexisnexis": {
-                    "method": self.scraper.search_lexisnexis,
-                    "params": ["first", "last"],
-                    "requires_key": bool(LEXISNEXIS_API_KEY),
-                    "description": "News, legal records, public filings"
+            "wealth_verification": {
+                "business_exits": {
+                    "method": self.scraper.search_business_exits,
+                    "params": ["first", "last", "company"],
+                    "requires_key": True,
+                    "description": "Business sales, IPOs, liquidity events with amounts"
                 },
-                "pacer": {
-                    "method": self.scraper.search_pacer,
-                    "params": ["first", "last"],
-                    "requires_key": bool(PACER_API_KEY),
-                    "description": "Federal court records"
-                },
-                "intelius": {
-                    "method": self.scraper.search_intelius,
+                "wealth_indicators": {
+                    "method": self.scraper.search_wealth_indicators,
                     "params": ["first", "last", "city", "state"],
-                    "requires_key": bool(INTELIUS_API_KEY),
-                    "description": "Background checks and public records"
+                    "requires_key": True,
+                    "description": "Real estate, planes (FAA), boats, luxury assets"
+                },
+                "family_foundation": {
+                    "method": self.scraper.search_family_foundation,
+                    "params": ["first", "last", "spouse_first", "spouse_last"],
+                    "requires_key": True,
+                    "description": "Family foundation 990-PFs, giving patterns"
                 }
             },
-            "web_research": {
-                "google": {
-                    "method": self.scraper.search_google,
-                    "params": ["query", "num"],
-                    "requires_key": bool(GOOGLE_API_KEY),
-                    "description": "General web search"
+            "ihs_alignment": {
+                "board_positions": {
+                    "method": self.scraper.search_all_board_positions,
+                    "params": ["first", "last"],
+                    "requires_key": True,
+                    "description": "ALL boards - corporate, nonprofit, advisory"
                 },
-                "scholar": {
-                    "method": self.scraper.search_scholar,
-                    "params": ["name", "max_results"],
-                    "requires_key": SCHOLARLY_AVAILABLE,
-                    "description": "Academic publications"
+                "academic_connections": {
+                    "method": self.scraper.search_academic_freedom_orgs,
+                    "params": ["first", "last"],
+                    "requires_key": True,
+                    "description": "FIRE, Heterodox Academy, ODC-type groups"
                 },
-                "inside_philanthropy": {
-                    "method": self.scraper.search_inside_philanthropy,
-                    "params": ["first", "last", "city", "state"],
-                    "requires_key": bool(GOOGLE_API_KEY),
-                    "description": "Inside Philanthropy articles"
-                },
-                "chronicle_philanthropy": {
-                    "method": self.scraper.search_chronicle_philanthropy,
-                    "params": ["first", "last", "city", "state"],
-                    "requires_key": bool(GOOGLE_API_KEY),
-                    "description": "Chronicle of Philanthropy coverage"
+                "liberty_network": {
+                    "method": self.scraper.search_liberty_organizations,
+                    "params": ["first", "last", "city"],
+                    "requires_key": True,
+                    "description": "Think tanks, classical liberal orgs"
+                }
+            },
+            "giving_history": {
+                "named_gifts": {
+                    "method": self.scraper.search_named_gifts,
+                    "params": ["first", "last", "spouse_first", "spouse_last"],
+                    "requires_key": True,
+                    "description": "Named buildings, programs, scholarships"
                 }
             }
         }
-
-    def conduct_deep_research(self, first, last, email=None, city=None, state=None, zip_code=None):
-        """Main orchestration method - AI decides what to search and when"""
         
+    async def research_person_deep(self, person: Dict, max_searches: int = 10) -> Dict:
+        """
+        Conduct deep research on a person using AI to guide the search sequence
+        Enhanced for IHS donor research
+        
+        Args:
+            person: Dict with 'first', 'last', 'city', 'state' keys
+            max_searches: Maximum number of searches to conduct
+            
+        Returns:
+            Dict with findings and analysis
+        """
+        print(f"\n🔬 Starting AI-guided deep research for {person['first']} {person['last']}")
+        print(f"   Location: {person.get('city', '')}, {person.get('state', '')}")
+        print(f"   Max searches: {max_searches}")
+        
+        # Initialize research context
         context = {
-            "person": {
-                "first": first,
-                "last": last,
-                "email": email,
-                "city": city,
-                "state": state,
-                "zip_code": zip_code
-            },
-            "findings": {},
-            "search_history": [],
-            "confidence_scores": {},
-            "research_strategy": None
+            'person': person,
+            'findings': [],
+            'search_history': [],
+            'key_facts': {},
+            'start_time': datetime.now(),
+            'spouse_info': None
         }
         
-        # Phase 1: Initial Assessment
-        print("  🤖 AI analyzing available data sources...")
-        context = self.ai_assess_available_sources(context)
+        # Conduct searches guided by AI
+        searches_conducted = 0
         
-        # Phase 2: Create Research Strategy
-        print("  🤖 AI creating research strategy...")
-        context = self.ai_create_research_strategy(context)
-        
-        # Phase 3: Execute Iterative Research
-        print("  🤖 Executing AI-guided deep research...")
-        max_iterations = 5
-        for i in range(max_iterations):
-            print(f"    • Research iteration {i+1}/{max_iterations}")
+        # For IHS research, always start with critical searches
+        if max_searches >= 15:  # If doing deep research
+            print("\n📋 Phase 1: IHS Critical Searches")
+            critical_searches = ["spouse_partner", "business_exits", "family_foundation", "google"]
+            for search_name in critical_searches:
+                if searches_conducted >= max_searches:
+                    break
+                await self._execute_search_by_name(search_name, context)
+                searches_conducted += 1
             
+            # Extract spouse info if found
+            self._extract_spouse_from_findings(context)
+        
+        # AI-guided searches for remaining budget
+        while searches_conducted < max_searches:
             # AI decides next searches
-            next_searches = self.ai_decide_next_searches(context)
+            next_searches = await self.ai_decide_next_searches(context)
             
             if not next_searches:
-                print("    ✓ AI determined research is complete")
+                print("\n✅ AI determined research is complete")
                 break
-            
-            # Execute searches
+                
+            # Execute the suggested searches
             for search in next_searches:
-                result = self.execute_search(search, context)
-                if result and result.get('data'):
-                    context['findings'][search['name']] = result
-                    context['search_history'].append(search)
-            
-            # AI analyzes findings and adjusts strategy
-            context = self.ai_analyze_iteration_results(context)
-            
-            # Brief pause between iterations
-            time.sleep(1)
+                if searches_conducted >= max_searches:
+                    break
+                    
+                print(f"\n📍 Search {searches_conducted + 1}/{max_searches}")
+                print(f"   AI selected: {search['name']} ({search['category']})")
+                print(f"   Reason: {search.get('reason', 'Strategic choice')}")
+                
+                # Execute the search
+                success = await self._execute_search(search, context)
+                searches_conducted += 1
+                
+                if not success:
+                    print(f"   ⚠️  Search failed, AI will adapt strategy")
         
-        # Phase 4: Deep Analysis
-        print("  🤖 AI performing deep analysis...")
-        context = self.ai_deep_analysis(context)
+        # Final synthesis by AI
+        print("\n🤖 AI synthesizing findings...")
+        synthesis = await self.ai_synthesize_research(context)
         
-        # Phase 5: Generate Final Report
-        print("  🤖 AI generating comprehensive report...")
-        final_report = self.ai_generate_final_report(context)
+        # Calculate IHS probability scores
+        ihs_scores = self._calculate_ihs_probability(context['findings'])
         
-        # Phase 6: Generate Executive Summary
-        print("  🤖 AI creating executive summary...")
-        exec_summary = self.ai_generate_executive_summary(context)
-        final_report['executive_summary'] = exec_summary
+        # Prepare final report
+        duration = (datetime.now() - context['start_time']).total_seconds()
         
-        # Phase 7: Generate Summary Table
-        print("  🤖 AI creating summary table...")
-        summary_table = self.ai_generate_summary_table(context)
-        final_report['summary_table'] = summary_table
+        final_report = {
+            'person': person,
+            'total_findings': len(context['findings']),
+            'searches_conducted': len(context['search_history']),
+            'duration_seconds': duration,
+            'synthesis': synthesis,
+            'ihs_scores': ihs_scores,
+            'key_facts': context['key_facts'],
+            'search_history': context['search_history'],
+            'findings': context['findings']
+        }
+        
+        print(f"\n✅ Research complete!")
+        print(f"   Total findings: {final_report['total_findings']}")
+        print(f"   Duration: {duration:.1f} seconds")
+        print(f"   IHS Probability: {ihs_scores['probability']}")
         
         return final_report
-
-    def ai_assess_available_sources(self, context):
-        """AI assesses which data sources are available and relevant"""
-        
-        # Build available sources summary
-        available = []
-        unavailable = []
-        
-        for category, sources in self.available_searches.items():
-            for name, config in sources.items():
-                if config['requires_key']:
-                    available.append({
-                        "name": name,
-                        "category": category,
-                        "description": config['description']
-                    })
-                else:
-                    unavailable.append({
-                        "name": name,
-                        "category": category,
-                        "description": config['description']
-                    })
-        
-        prompt = f"""
-        Assess available data sources for researching this person:
-        
-        Target: {context['person']['first']} {context['person']['last']}
-        Location: {context['person'].get('city', 'Unknown')}, {context['person'].get('state', 'Unknown')}
-        Email: {context['person'].get('email', 'Not provided')}
-        
-        Available data sources:
-        {json.dumps(available, indent=2)}
-        
-        Unavailable sources (no API key):
-        {json.dumps(unavailable, indent=2)}
-        
-        Provide:
-        1. Which sources are most critical for this research
-        2. What information gaps exist due to unavailable sources
-        3. Alternative strategies to compensate for missing sources
-        4. Priority ranking of available sources
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-            
-            context['source_assessment'] = response.choices[0].message.content
-        except Exception as e:
-            print(f"    ✗ AI assessment error: {str(e)}")
-            context['source_assessment'] = "Error in AI assessment"
-        
-        return context
-
-    def ai_create_research_strategy(self, context):
-        """AI creates a comprehensive research strategy"""
-        
-        prompt = f"""
-        Create a detailed research strategy for this donor prospect:
-        
-        Person: {json.dumps(context['person'], indent=2)}
-        Available sources assessment: {context.get('source_assessment', 'Not available')}
-        
-        Design a research strategy that:
-        1. Identifies the person with high confidence
-        2. Determines wealth and capacity
-        3. Uncovers philanthropic interests and history
-        4. Maps relationships and networks
-        5. Identifies cultivation opportunities
-        6. Assesses ideological alignment with classical liberal principles
-        7. Evaluates potential for supporting academic freedom initiatives
-        
-        Return a JSON object with this structure:
-        {{
-            "phases": [
-                {{
-                    "name": "Identity Verification",
-                    "searches": ["clearbit", "pdl", "google"],
-                    "goals": ["Confirm identity", "Find contact info"],
-                    "decision_logic": "If email found, proceed to enrichment"
-                }}
-            ],
-            "priority_sources": ["wealthengine", "fec", "irs_990"],
-            "fallback_strategies": ["Use Google if paid APIs unavailable"]
-        }}
-        
-        Return ONLY valid JSON, no markdown formatting or explanation.
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4
-            )
-            
-            # Parse the response as JSON
-            response_text = response.choices[0].message.content
-            # Clean up the response if needed
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0]
-            context['research_strategy'] = json.loads(response_text.strip())
-        except Exception as e:
-            print(f"    ✗ AI strategy error: {str(e)}")
-            # Fallback strategy
-            context['research_strategy'] = {
-                "phases": [
-                    {
-                        "name": "Basic Search",
-                        "searches": ["google", "irs_990", "fec"],
-                        "goals": ["Initial data gathering"]
-                    }
-                ]
-            }
-        
-        return context
-
-    def ai_decide_next_searches(self, context):
-        """AI decides which searches to run next based on current findings"""
+    
+    async def ai_decide_next_searches(self, context):
+        """AI decides which searches to run next based on IHS priorities"""
         
         # Get unused searches
         used_searches = {s['name'] for s in context['search_history']}
         available_unused = []
         
+        # IHS Priority order - these go first
+        ihs_priority_searches = [
+            "spouse_partner",      # CRITICAL - family giving decisions
+            "business_exits",      # CRITICAL - liquidity events
+            "family_foundation",   # CRITICAL - giving vehicle
+            "college_connections", # HIGH - warm intros
+            "board_positions",     # HIGH - interests/influence
+            "academic_connections",# HIGH - IHS alignment
+            "wealth_indicators",   # HIGH - capacity verification
+            "named_gifts",        # HIGH - giving history
+            "liberty_network",    # MEDIUM - ideological fit
+            "fec",                # MEDIUM - political alignment
+            "social_clubs",       # MEDIUM - peer networks
+        ]
+        
+        # First add IHS priority searches if unused
+        for priority_search in ihs_priority_searches:
+            for category, sources in self.available_searches.items():
+                if priority_search in sources and priority_search not in used_searches:
+                    if sources[priority_search]['requires_key'] and not self._has_required_keys(sources[priority_search]):
+                        continue
+                    
+                    priority_level = "CRITICAL" if priority_search in ["spouse_partner", "business_exits", "family_foundation"] else "HIGH"
+                    available_unused.append({
+                        "category": category,
+                        "name": priority_search,
+                        "description": sources[priority_search]['description'],
+                        "params": sources[priority_search]['params'],
+                        "priority": priority_level
+                    })
+        
+        # Then add other available searches
         for category, sources in self.available_searches.items():
             for name, config in sources.items():
-                if name not in used_searches and config['requires_key']:
+                if name not in used_searches and name not in ihs_priority_searches:
+                    if config['requires_key'] and not self._has_required_keys(config):
+                        continue
+                    
                     available_unused.append({
                         "category": category,
                         "name": name,
                         "description": config['description'],
-                        "params": config['params']
+                        "params": config['params'],
+                        "priority": "MEDIUM"
                     })
         
         if not available_unused:
             return []
         
+        # Calculate IHS research gaps
+        gaps = self._identify_ihs_gaps(context)
+        
         prompt = f"""
-        Based on current research progress, decide next searches to execute.
+        Based on IHS donor research priorities (Beth Miller standard), decide next searches.
         
         Person: {json.dumps(context['person'], indent=2)}
-        Current findings summary: {len(context['findings'])} sources searched
-        Research strategy: {json.dumps(context.get('research_strategy', {}), indent=2)}
+        Current findings: {len(context['findings'])} sources
+        
+        Research gaps:
+        - Spouse researched: {gaps['spouse_found']}
+        - Liquidity events found: {gaps['liquidity_found']}
+        - Board positions found: {gaps['boards_count']}
+        - Academic freedom connections: {gaps['academic_freedom']}
+        - Warm intro paths: {gaps['warm_intros']}
         
         Available searches not yet used:
         {json.dumps(available_unused, indent=2)}
         
-        Return a JSON object with a "searches" array containing up to 3 next searches:
+        Select up to 3 searches prioritizing:
+        1. CRITICAL searches (spouse, business exits, foundation)
+        2. Information gaps for IHS probability matrix
+        3. Warm introduction opportunities
+        
+        Return JSON:
         {{
             "searches": [
                 {{
-                    "category": "wealth_screening",
-                    "name": "wealthengine",
-                    "reason": "Need wealth estimate",
-                    "params": {{"first": "John", "last": "Doe"}}
+                    "category": "category_name",
+                    "name": "search_name",
+                    "reason": "specific reason needed",
+                    "params": {{"param_name": "value"}}
                 }}
             ]
         }}
         
-        Return empty array if research is complete.
-        Return ONLY valid JSON, no markdown formatting or explanation.
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-            
-            # Parse the response as JSON
-            response_text = response.choices[0].message.content
-            # Clean up the response if needed
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0]
-            result = json.loads(response_text.strip())
-            return result.get('searches', [])
-        except Exception as e:
-            print(f"    ✗ AI decision error: {str(e)}")
-            # Fallback to basic searches
-            if len(context['search_history']) < 3:
-                return [
-                    {
-                        "category": "web_research",
-                        "name": "google",
-                        "params": {"query": f'"{context["person"]["first"]} {context["person"]["last"]}"', "num": 5}
-                    }
-                ]
-            return []
-
-    def execute_search(self, search_spec, context):
-        """Execute a specific search based on AI instructions"""
-        
-        category = search_spec.get('category')
-        name = search_spec.get('name')
-        params = search_spec.get('params', {})
-        
-        if not category or not name:
-            return None
-            
-        if category not in self.available_searches:
-            return None
-            
-        if name not in self.available_searches[category]:
-            return None
-            
-        search_config = self.available_searches[category][name]
-        method = search_config['method']
-        
-        # Map parameters from context if needed
-        call_params = {}
-        for param_name in search_config['params']:
-            if param_name in params:
-                call_params[param_name] = params[param_name]
-            elif param_name in context['person']:
-                call_params[param_name] = context['person'][param_name]
-        
-        try:
-            print(f"      → Searching {name}...")
-            result = method(**call_params)
-            return {
-                "data": result,
-                "source": name,
-                "timestamp": datetime.now().isoformat(),
-                "params_used": call_params
-            }
-        except Exception as e:
-            print(f"      ✗ Error in {name}: {str(e)}")
-            return {
-                "error": str(e),
-                "source": name,
-                "timestamp": datetime.now().isoformat()
-            }
-
-    def ai_analyze_iteration_results(self, context):
-        """AI analyzes results from latest searches"""
-        
-        if not context['findings']:
-            return context
-        
-        # Get summary of findings
-        findings_summary = {}
-        for name, result in context['findings'].items():
-            if result.get('data'):
-                findings_summary[name] = {
-                    "has_data": True,
-                    "data_type": type(result['data']).__name__,
-                    "data_size": len(str(result['data']))
-                }
-        
-        prompt = f"""
-        Analyze the research progress and findings.
-        
-        Person: {context['person']['first']} {context['person']['last']}
-        Total searches completed: {len(context['search_history'])}
-        Findings summary: {json.dumps(findings_summary, indent=2)}
-        
-        Return a JSON object with:
-        {{
-            "key_insights": ["insight1", "insight2"],
-            "confidence_scores": {{
-                "identity": 85,
-                "wealth": 60,
-                "interests": 70
-            }},
-            "missing_info": ["what we still need"],
-            "continue_research": true
-        }}
-        
-        Return ONLY valid JSON, no markdown formatting or explanation.
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-            
-            # Parse the response as JSON
-            response_text = response.choices[0].message.content
-            # Clean up the response if needed
-            if "```json" in response_text:
-                response_text = response_text.split("```json")[1].split("```")[0]
-            analysis = json.loads(response_text.strip())
-            context['iteration_analysis'] = analysis
-            context['confidence_scores'] = analysis.get('confidence_scores', {})
-        except Exception as e:
-            print(f"    ✗ AI analysis error: {str(e)}")
-            context['confidence_scores'] = {"identity": 50, "wealth": 50, "interests": 50}
-        
-        return context
-
-    def ai_deep_analysis(self, context):
-        """Comprehensive analysis of all findings focused on IHS donor research"""
-        
-        # Prepare findings summary
-        findings_text = []
-        for name, result in context['findings'].items():
-            if result.get('data'):
-                findings_text.append(f"\n{name.upper()}:")
-                findings_text.append(json.dumps(result['data'], indent=2)[:1000])
-        
-        prompt = f"""
-        Perform deep donor research analysis for {context['person']['first']} {context['person']['last']}.
-        
-        Location: {context['person'].get('city', 'Unknown')}, {context['person'].get('state', 'Unknown')}
-        Email: {context['person'].get('email', 'Not provided')}
-        
-        Research Findings:
-        {''.join(findings_text)}
-        
-        Provide comprehensive donor intelligence analysis for the Institute for Humane Studies (IHS):
-        
-        1. **Identity Verification**
-           - Confirm full name, age, location
-           - Professional identity and current positions
-           - Family members relevant to giving decisions
-           - Confidence level: [X]% based on [specific evidence]
-        
-        2. **Wealth Assessment**
-           - Net worth estimate: $[X] million (range: $[Y]-[Z] million)
-           - Wealth sources: [business sale, salary, investments, inheritance]
-           - Recent liquidity events: [IPO, acquisition, sale dates and amounts]
-           - Real estate: [properties with estimated values]
-           - Business holdings: [current stakes and values]
-        
-        3. **Annual Giving Capacity**
-           - Conservative (1% of net worth): $[amount]
-           - Moderate (5% of net worth): $[amount]  
-           - Aggressive (10% of net worth): $[amount]
-           - Largest known gift: $[amount] to [recipient]
-        
-        4. **Philanthropic Profile**
-           - Total political giving: $[amount] ([years])
-           - Top recipients: [list with amounts]
-           - Nonprofit board positions: [organizations]
-           - Foundation affiliations: [names and roles]
-           - Giving interests: [education, free speech, economics, etc.]
-           - Named gifts: [facilities, programs, scholarships]
-        
-        5. **Ideological Indicators**
-           - Political affiliation: [R/D/I] based on [giving patterns]
-           - Think tank involvement: [organizations]
-           - Academic freedom activities: [specific examples]
-           - Published writings: [topics and outlets]
-           - Public statements on higher ed: [quotes with sources]
-           - Free market orientation: [High/Medium/Low] based on [evidence]
-        
-        6. **IHS Alignment Score**
-           - Mission alignment: [X]/10
-           - Classical liberal principles: [supports/neutral/opposes]
-           - Academic freedom commitment: [evidence]
-           - Student development interest: [evidence]
-           - Free market support: [evidence]
-        
-        7. **Cultivation Intelligence**
-           - Decision timeline: [quick/deliberative]
-           - Recognition preferences: [anonymous/public]
-           - Giving vehicles: [cash/stock/foundation/DAF]
-           - Influence points: [who influences their giving]
-           - Competing nonprofits: [similar organizations they support]
-        
-        8. **Recommended IHS Approach**
-           - Initial contact: [specific person who should reach out]
-           - Programs to highlight: [specific IHS initiatives]
-           - Events to invite to: [specific IHS gatherings]
-           - Ask amount: $[specific range] for [specific purpose]
-           - Timeline: [cultivation period needed]
-        
-        Be specific with names, amounts, dates, and sources throughout.
-        Focus on actionable intelligence for IHS major gift fundraising.
+        Return ONLY valid JSON.
         """
         
         try:
@@ -738,88 +369,287 @@ class AIDeepResearchOrchestrator:
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=3000
+                max_tokens=1000
             )
             
-            context['deep_analysis'] = response.choices[0].message.content
+            response_text = response.choices[0].message.content
+            # Clean up response
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+                
+            result = json.loads(response_text.strip())
+            return result.get('searches', [])
+            
         except Exception as e:
-            print(f"    ✗ AI deep analysis error: {str(e)}")
-            context['deep_analysis'] = "Error in deep analysis"
+            print(f"    ✗ AI decision error: {str(e)}")
+            # Return first CRITICAL search if available
+            critical = next((s for s in available_unused if s.get('priority') == 'CRITICAL'), None)
+            if critical:
+                return [{
+                    "category": critical['category'],
+                    "name": critical['name'],
+                    "reason": "Critical IHS priority search",
+                    "params": {p: context['person'].get(p, '') for p in critical['params']}
+                }]
+            return []
+    
+    def _identify_ihs_gaps(self, context):
+        """Identify research gaps for IHS assessment"""
         
-        return context
-
-    def ai_generate_final_report(self, context):
-        """Generate comprehensive final report in IHS donor research style"""
+        findings_text = ' '.join([str(f) for f in context.get('findings', [])]).lower()
+        
+        return {
+            'spouse_found': 'Yes' if any(term in findings_text for term in ['spouse', 'wife', 'husband', 'married to']) else 'No',
+            'liquidity_found': 'Yes' if any(term in findings_text for term in ['sold company', 'acquisition', 'ipo', 'exit']) else 'No',
+            'boards_count': findings_text.count('board'),
+            'academic_freedom': 'Yes' if any(term in findings_text for term in ['fire', 'heterodox', 'free speech', 'academic freedom']) else 'No',
+            'warm_intros': len([f for f in context['findings'] if 'classmate' in str(f) or 'colleague' in str(f) or 'board' in str(f)])
+        }
+    
+    def _extract_spouse_from_findings(self, context):
+        """Extract spouse information from findings"""
+        
+        for finding in context['findings']:
+            text = (finding.get('snippet', '') + ' ' + finding.get('summary', '')).lower()
+            
+            # Look for spouse patterns
+            patterns = [
+                r'married to ([A-Z][a-z]+ [A-Z][a-z]+)',
+                r'wife ([A-Z][a-z]+ [A-Z][a-z]+)',
+                r'husband ([A-Z][a-z]+ [A-Z][a-z]+)'
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, finding.get('snippet', ''))
+                if match:
+                    spouse_name = match.group(1)
+                    context['spouse_info'] = {
+                        'full_name': spouse_name,
+                        'first': spouse_name.split()[0],
+                        'last': spouse_name.split()[-1]
+                    }
+                    context['person']['spouse_first'] = context['spouse_info']['first']
+                    context['person']['spouse_last'] = context['spouse_info']['last']
+                    print(f"   ✓ Identified spouse: {spouse_name}")
+                    return
+    
+    def _calculate_ihs_probability(self, findings):
+        """Calculate IHS giving probability scores"""
+        
+        all_text = ' '.join([str(f) for f in findings]).lower()
+        
+        scores = {
+            'financial_capacity': 0,
+            'philanthropic_inclination': 0,
+            'ideological_alignment': 0,
+            'existing_relationship': 0
+        }
+        
+        # Financial Capacity
+        if any(term in all_text for term in ['sold company', 'acquisition', 'billion', 'ipo']):
+            scores['financial_capacity'] = 90
+        elif any(term in all_text for term in ['million', 'founder', 'ceo']):
+            scores['financial_capacity'] = 70
+        else:
+            scores['financial_capacity'] = 40
+        
+        # Philanthropic Inclination
+        phil_count = sum(1 for f in findings if 'philanthrop' in str(f).lower() or 'donat' in str(f).lower())
+        board_count = sum(1 for f in findings if 'board' in str(f).lower())
+        scores['philanthropic_inclination'] = min(100, (phil_count * 15) + (board_count * 10) + 20)
+        
+        # Ideological Alignment
+        alignment_count = sum(1 for term in ['free speech', 'academic freedom', 'liberty', 'classical liberal'] 
+                             if term in all_text)
+        scores['ideological_alignment'] = min(100, alignment_count * 25 + 20)
+        
+        # Overall
+        overall = (scores['financial_capacity'] * 0.3 + 
+                  scores['philanthropic_inclination'] * 0.3 + 
+                  scores['ideological_alignment'] * 0.3 + 
+                  scores['existing_relationship'] * 0.1)
+        
+        return {
+            'scores': scores,
+            'overall': overall,
+            'probability': 'High' if overall >= 70 else 'Medium' if overall >= 40 else 'Low'
+        }
+    
+    async def _execute_search_by_name(self, search_name, context):
+        """Execute a search by name"""
+        
+        for category, sources in self.available_searches.items():
+            if search_name in sources:
+                search_config = {
+                    'name': search_name,
+                    'category': category,
+                    'params': {p: context['person'].get(p, '') for p in sources[search_name]['params']}
+                }
+                await self._execute_search(search_config, context)
+                return
+    
+    async def _execute_search(self, search_config, context):
+        """
+        Execute a single search based on AI recommendation
+        
+        Args:
+            search_config: Dict with 'category', 'name', 'params'
+            context: Research context
+            
+        Returns:
+            bool: Success status
+        """
+        category = search_config['category']
+        name = search_config['name']
+        params = search_config.get('params', {})
+        
+        # Get the search configuration
+        if category not in self.available_searches or name not in self.available_searches[category]:
+            print(f"   ✗ Unknown search: {category}/{name}")
+            return False
+            
+        search_info = self.available_searches[category][name]
+        method = search_info['method']
+        
+        # Check for required API keys
+        if search_info['requires_key'] and not self._has_required_keys(search_info):
+            print(f"   ✗ Missing API key for {name}")
+            return False
+        
+        # Execute the search
+        try:
+            print(f"   🔍 Executing {name} search...")
+            results = await method(**params)
+            
+            if results:
+                print(f"   ✓ Found {len(results)} results")
+                context['findings'].extend(results)
+                
+                # Extract key facts
+                self._extract_key_facts(results, context)
+            else:
+                print(f"   - No results found")
+                
+            # Record in search history
+            context['search_history'].append({
+                'name': name,
+                'category': category,
+                'timestamp': datetime.now().isoformat(),
+                'results_count': len(results) if results else 0,
+                'params': params
+            })
+            
+            return True
+            
+        except Exception as e:
+            print(f"   ✗ Error: {str(e)}")
+            context['search_history'].append({
+                'name': name,
+                'category': category,
+                'timestamp': datetime.now().isoformat(),
+                'error': str(e),
+                'params': params
+            })
+            return False
+    
+    def _has_required_keys(self, search_info):
+        """Check if required API keys are available"""
+        # This is a simplified check - implement based on your scraper's key management
+        return True
+    
+    def _extract_key_facts(self, results, context):
+        """Extract and store key facts from search results"""
+        for result in results:
+            # Extract emails
+            if 'email' in result:
+                if 'emails' not in context['key_facts']:
+                    context['key_facts']['emails'] = set()
+                context['key_facts']['emails'].add(result['email'])
+                
+            # Extract phone numbers
+            if 'phone' in result:
+                if 'phones' not in context['key_facts']:
+                    context['key_facts']['phones'] = set()
+                context['key_facts']['phones'].add(result['phone'])
+                
+            # Extract addresses
+            if 'address' in result:
+                if 'addresses' not in context['key_facts']:
+                    context['key_facts']['addresses'] = []
+                context['key_facts']['addresses'].append(result['address'])
+                
+            # Extract employment
+            if 'company' in result or 'employer' in result:
+                if 'employment' not in context['key_facts']:
+                    context['key_facts']['employment'] = []
+                context['key_facts']['employment'].append(
+                    result.get('company', result.get('employer', ''))
+                )
+    
+    async def ai_synthesize_research(self, context):
+        """
+        Use AI to synthesize all findings into a comprehensive analysis
+        Enhanced for IHS donor report format
+        """
+        # Prepare findings summary
+        findings_by_source = defaultdict(list)
+        for finding in context['findings']:
+            source = finding.get('source', 'unknown')
+            findings_by_source[source].append(finding)
+        
+        # Create structured summary for AI
+        findings_summary = []
+        for source, items in findings_by_source.items():
+            findings_summary.append(f"\n{source.upper()} ({len(items)} results):")
+            for item in items[:5]:  # First 5 from each source
+                if 'summary' in item:
+                    findings_summary.append(f"- {item['summary']}")
+                elif 'snippet' in item:
+                    findings_summary.append(f"- {item['snippet'][:200]}...")
+        
+        findings_text = "\n".join(findings_summary)
+        
+        # Calculate IHS scores
+        ihs_scores = self._calculate_ihs_probability(context['findings'])
         
         prompt = f"""
-        Create a comprehensive IHS donor research report for {context['person']['first']} {context['person']['last']}.
+        Create a comprehensive IHS donor research report following the Beth Miller format.
         
-        Deep Analysis Results:
-        {context.get('deep_analysis', 'Not available')}
+        Person: {json.dumps(context['person'], indent=2)}
+        Total findings: {len(context['findings'])}
         
-        Raw Findings Data:
-        {json.dumps(context.get('findings', {}), indent=2)[:3000]}
+        Key findings by source:
+        {findings_text}
         
-        Generate a FULL NARRATIVE DONOR REPORT following this EXACT structure:
+        Generate THREE documents:
         
-        **Full Narrative Donor Report**
+        1. EXECUTIVE SUMMARY (2 pages):
+        - Biographical Overview (education, career, family including spouse)
+        - Career Trajectory & Financial Capacity (emphasize liquidity events)
+        - Philanthropic Interests (specific organizations and amounts)
+        - Ideological Alignment & Networks (liberty/academic freedom connections)
+        - Probability Matrix Assessment (High/Medium/Low with evidence):
+          * Financial Capacity: {self._score_to_level(ihs_scores['scores']['financial_capacity'])}
+          * Philanthropic Inclination: {self._score_to_level(ihs_scores['scores']['philanthropic_inclination'])}
+          * Ideological Alignment with IHS: {self._score_to_level(ihs_scores['scores']['ideological_alignment'])}
+          * Existing IHS Relationship: Low
+          * Overall Giving Probability: {ihs_scores['probability']}
+        - Recommended IHS Engagement Steps (4 specific actions)
         
-        **Background & Career**
-        [Write 3-4 detailed paragraphs covering:]
-        - Educational background with specific schools, degrees, and graduation years
-        - Career progression with company names, positions, and timeframes
-        - Current professional status and activities
-        - Family background if relevant to wealth/philanthropy
-        - Include inline citations like [[source.com]{{.underline}}](URL#:~:text=specific,text)
+        2. FULL NARRATIVE REPORT with sections:
+        - Background & Career (include spouse details)
+        - Financial Capacity & Wealth Indicators
+        - Philanthropic Track Record
+        - Ideological Profile and Networks
+        - Strategic Considerations for IHS
         
-        **Financial Capacity & Wealth Indicators**
-        [Write 3-4 detailed paragraphs covering:]
-        - Specific wealth sources (business sales, inheritance, salary, investments)
-        - Real estate holdings with addresses and values if found
-        - Business ownership stakes and exits
-        - Estimated net worth ranges with supporting evidence
-        - Liquidity events and their approximate values
-        - Investment patterns and portfolios
-        - Include specific dollar amounts when available
+        3. SUMMARY TABLE with all key facts
         
-        **Philanthropic Interests & Track Record**
-        [Write 3-4 detailed paragraphs covering:]
-        - Major gifts with specific amounts and recipients
-        - Foundation affiliations and board positions
-        - Causes supported with examples
-        - Giving patterns over time
-        - Named gifts or facilities
-        - Volunteer activities and time commitments
-        - Collaborative giving with family/peers
-        
-        **Ideological Profile and Network Affiliations**
-        [Write 3-4 detailed paragraphs covering:]
-        - Political giving history with specific candidates/PACs and amounts
-        - Think tank or policy organization involvement
-        - Academic freedom or free speech activities
-        - Board memberships and their ideological leanings
-        - Public statements or writings on political/social issues
-        - Network connections to other major donors
-        - Assessment of alignment with classical liberal principles
-        
-        **Strategic Considerations for IHS Engagement**
-        [Write 3-4 detailed paragraphs covering:]
-        - Specific IHS programs that would resonate
-        - Best approach for initial contact (who should make introduction)
-        - Family dynamics and decision-making process
-        - Recognition preferences
-        - Potential ask amounts based on capacity and history
-        - Timing considerations
-        - Specific engagement event ideas
-        - How to frame IHS mission to align with their interests
-        
-        CRITICAL INSTRUCTIONS:
-        1. Every factual claim must have an inline citation with the exact format: [[source]{{.underline}}](URL)
-        2. Include specific names, dates, dollar amounts, and percentages
-        3. Write in narrative style with full paragraphs, not bullet points
-        4. Focus on information relevant to IHS's mission of advancing classical liberal ideas in academia
-        5. Make strategic recommendations specific and actionable
-        6. Assess ideological alignment honestly but diplomatically
+        Format with **bold headers** and organized sections.
+        Every fact must have [[source]] notation.
+        Focus on IHS mission alignment: intellectual talent development, academic programs, ideas to market.
         """
         
         try:
@@ -830,929 +660,162 @@ class AIDeepResearchOrchestrator:
                 max_tokens=4000
             )
             
-            final_report_text = response.choices[0].message.content
-        except Exception as e:
-            print(f"    ✗ AI report generation error: {str(e)}")
-            final_report_text = "Error generating final report"
-        
-        return {
-            "name": f"{context['person']['first']} {context['person']['last']}",
-            "search_context": context['person'],
-            "confidence_scores": context.get('confidence_scores', {}),
-            "findings": context['findings'],
-            "deep_analysis": context.get('deep_analysis', ''),
-            "final_report": final_report_text,
-            "search_history": context['search_history'],
-            "total_searches": len(context['search_history']),
-            "timestamp": datetime.now().isoformat()
-        }
-
-    def ai_generate_executive_summary(self, context):
-        """Generate 2-page executive summary in IHS style"""
-        
-        prompt = f"""
-        Create a 2-page executive summary for IHS donor prospect: {context['person']['first']} {context['person']['last']}
-        Location: {context['person'].get('city', '')}, {context['person'].get('state', '')}
-        
-        Based on research findings:
-        {context.get('deep_analysis', '')[:2000]}
-        
-        Follow this EXACT format:
-        
-        **{context['person']['first']} {context['person']['last']} -- {context['person'].get('city', 'Location Unknown')}, {context['person'].get('state', '')}**
-        
-        **Executive Summary**
-        
-        **Biographical Overview:** [One paragraph with education, career, family, current status. Include inline citations [[source]{{.underline}}](URL)]
-        
-        **Career Trajectory & Financial Capacity:** [One paragraph detailing career progression, business ventures, wealth sources, and estimated capacity. Include specific companies, positions, and dollar ranges with citations]
-        
-        **Philanthropic Interests:** [One paragraph covering major gifts, causes supported, giving vehicles, and patterns. Include specific organizations and amounts with citations]
-        
-        **Ideological Alignment & Networks:** [One paragraph on political/ideological leanings, relevant board positions, think tank involvement, and network connections. Focus on alignment with classical liberal principles]
-        
-        **Probability of Giving -- Matrix Assessment:**
-        - *Financial Capacity:* **[High/Moderate/Low].** [Brief explanation with evidence]
-        - *Philanthropic Inclination:* **[High/Moderate/Low].** [Evidence of past giving]
-        - *Ideological Alignment with IHS:* **[High/Moderate/Low].** [Specific alignment points]
-        - *Existing Relationship with IHS:* **[High/Moderate/Low].** [Any connections]
-        - **Overall Giving Probability:** **[High/Moderate/Low].** [Summary assessment]
-        
-        **Recommended Engagement Steps for IHS:**
-        - **[Action Title]:** [Specific step with details on who, what, when, how]
-        - **[Action Title]:** [Specific step focused on IHS programs that align with their interests]
-        - **[Action Title]:** [Specific step for cultivation events or meetings]
-        - **[Action Title]:** [Specific step for ask strategy and amount]
-        
-        Use inline citations throughout: [[source]{{.underline}}](URL)
-        Be specific with names, titles, amounts, and dates.
-        Focus on actionable intelligence for IHS fundraising.
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=2000
-            )
-            
             return response.choices[0].message.content
-        except Exception as e:
-            print(f"    ✗ AI executive summary error: {str(e)}")
-            return "Error generating executive summary"
-
-    def ai_generate_summary_table(self, context):
-        """Generate summary table in IHS style"""
-        
-        prompt = f"""
-        Create a donor prospect summary table for {context['person']['first']} {context['person']['last']}.
-        
-        Research findings:
-        {json.dumps(context.get('findings', {}), indent=2)[:2000]}
-        {context.get('deep_analysis', '')[:1000]}
-        
-        Generate a summary table with EXACTLY this format:
-        
-        **Summary Table -- {context['person']['first']} {context['person']['last']}**
-        
-        Create a table with these exact rows (use the labels exactly as shown):
-        
-        **Profile Aspect** | **Details** | **Sources**
-        ---|---|---
-        **Education** | [Specific schools, degrees, years, honors] | [Source citations with [[site]{{.underline}}](URL)]
-        **Career** | [Companies, positions, timeline, current role] | [Citations]
-        **Family & Wealth Origin** | [Spouse, family business, inheritance, major liquidity events] | [Citations]
-        **Notable Philanthropy** | [Major gifts, foundations, causes, amounts] | [Citations]
-        **Ideological Involvement** | [Political giving, think tanks, advocacy groups, free speech initiatives] | [Citations]
-        **Network Affiliations** | [Boards, clubs, donor networks, co-donors] | [Citations]
-        **Capacity for Giving** | **[High/Moderate/Low].** [Specific evidence, net worth range, liquidity] | [Citations]
-        **Alignment with IHS** | **[Strong/Moderate/Weak].** [Specific points of alignment with classical liberal mission] | [Citations]
-        **Engagement Interests** | [What motivates them, recognition preferences, giving style] | [Citations or "Inferred from..."]
-        **Potential IHS Strategy** | [Specific approaches, programs to highlight, ask strategy] | *Strategy based on profile analysis above.*
-        
-        Each detail should be specific with names, amounts, dates.
-        Every factual claim needs a citation in the format: [[source]{{.underline}}](URL#:~:text=relevant,excerpt)
-        Focus on information relevant to IHS donor cultivation.
-        """
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=2000
-            )
             
-            return response.choices[0].message.content
         except Exception as e:
-            print(f"    ✗ AI summary table error: {str(e)}")
-            return "Error generating summary table"
-
-# ——— ENHANCED SCRAPER CLASS ———————————————————————————————
-class EnhancedDonorScraper:
-    def __init__(self):
-        # API endpoints
-        self.we_url   = "https://api.wealthengine.com/v1/profile/find_one_full"
-        self.iw_url   = "https://api.iwave.com/people/search"
-        self.esri_url = "https://geoenrich.arcgis.com/arcgis/rest/services/World/GeoEnrichmentServer/GeoEnrichment/enrich"
-        self.clearbit_url = "https://person.clearbit.com/v2/people/find"
-        self.pdl_enrich_url = "https://api.peopledatalabs.com/v5/person/enrich"
-        self.pdl_search_url = "https://api.peopledatalabs.com/v5/person/search"
-        self.fec_url  = "https://api.open.fec.gov/v1/schedules/schedule_a/"
-        self.os_url   = "https://www.opensecrets.org/api/"
-        self.cs_url   = "https://www.googleapis.com/customsearch/v1"
-        self.propublica_527_url = "https://projects.propublica.org/nonprofits/api/v2/search.json"
-        self.sec_edgar_url = "https://www.sec.gov/cgi-bin/browse-edgar"
-        self.rocketreach_url = "https://api.rocketreach.co/v2/api/lookupProfile"
-        self.debounce_url = "https://api.debounce.io/v1/"
-        
-        # Initialize AI orchestrator if available
-        self.ai_orchestrator = None
-        if OPENAI_API_KEY and OPENAI_AVAILABLE:
-            try:
-                self.ai_orchestrator = AIDeepResearchOrchestrator(self)
-                print("✓ AI Deep Research Engine initialized")
-            except Exception as e:
-                print(f"✗ AI initialization failed: {e}")
-                print("Please check your OpenAI API key")
-
-    # ——— ALL SEARCH METHODS (kept for AI to use) ——————————————
-    def search_wealthengine(self, first, last, **opts):
-        if not WEALTHENGINE_API_KEY: return {}
-        params = {"firstName": first, "lastName": last, **{k:v for k,v in opts.items() if v}}
-        headers = {"Authorization": f"Bearer {WEALTHENGINE_API_KEY}"}
-        try:
-            r = requests.get(self.we_url, params=params, headers=headers, timeout=10)
-            if r.ok:
-                d = r.json()
-                return {
-                    "net_worth": d.get("estimatedNetWorth"),
-                    "gift_capacity": d.get("giftCapacity"),
-                    "source": "WealthEngine"
-                }
-        except: pass
-        return {}
-
-    def search_iwave(self, first, last, city=None, state=None):
-        if not IWAVE_API_KEY: return {}
-        params = {"first_name": first, "last_name": last, "city": city, "state": state}
-        headers = {"X-API-KEY": IWAVE_API_KEY}
-        try:
-            r = requests.get(self.iw_url, params=params, headers=headers, timeout=10)
-            if r.ok:
-                d = r.json()
-                return {
-                    "philanthropy_score": d.get("philanthropyScore"),
-                    "net_worth": d.get("netWorth"),
-                    "source": "iWave"
-                }
-        except: pass
-        return {}
-
-    def search_clearbit(self, email):
-        if not CLEARBIT_API_KEY or not email: return {}
-        headers = {"Authorization": f"Bearer {CLEARBIT_API_KEY}"}
-        try:
-            r = requests.get(f"{self.clearbit_url}?email={email}", headers=headers, timeout=10)
-            if r.status_code == 200:
-                d = r.json()
-                return {
-                    "full_name": d.get("name", {}).get("fullName"),
-                    "employment": d.get("employment"),
-                    "linkedin": d.get("linkedin"),
-                    "facebook": d.get("facebook"),
-                    "bio": d.get("bio"),
-                    "source": "Clearbit"
-                }
-        except: pass
-        return {}
-
-    def search_pdl(self, email=None, first=None, last=None, city=None, state=None):
-        if not PDL_API_KEY: return {}
-        headers = {"Authorization": f"Bearer {PDL_API_KEY}"}
-        try:
-            if email:
-                params = {"email": email}
-                r = requests.get(self.pdl_enrich_url, params=params, headers=headers, timeout=10)
-                person = r.json().get("data", {})
-            else:
-                params = {"sql": f'SELECT * FROM person WHERE full_name="{first} {last}"'}
-                if city: params["sql"] += f' AND location_locality="{city}"'
-                if state: params["sql"] += f' AND location_region="{state}"'
-                r = requests.get(self.pdl_search_url, params=params, headers=headers, timeout=10)
-                hits = r.json().get("data", [])
-                person = hits[0] if hits else {}
-            prof = {
-                "linkedin": None, "facebook": None,
-                "job_title": person.get("job_title"),
-                "job_company": person.get("job_company"),
-                "education": person.get("education"),
-                "source": "PDL"
-            }
-            for p in person.get("profiles", []):
-                if p.get("network") == "linkedin": prof["linkedin"] = p.get("url")
-                if p.get("network") == "facebook": prof["facebook"] = p.get("url")
-            return prof
-        except: return {}
-
-    def search_fec(self, first, last, state=None, city=None, zip_code=None):
-        if not FEC_API_KEY: return []
-        params = {
-            "api_key": FEC_API_KEY, 
-            "contributor_name": f'"{first} {last}"',
-            "per_page": 50
-        }
-        
-        if state: 
-            params["contributor_state"] = state
-        if zip_code: 
-            params["contributor_zip"] = zip_code
-            
-        try:
-            r = requests.get(self.fec_url, params=params, timeout=10)
-            if r.ok:
-                results = []
-                for rec in r.json().get("results", []):
-                    contrib_city = rec.get("contributor_city", "").lower()
-                    contrib_state = rec.get("contributor_state", "").upper()
-                    
-                    if city and contrib_city:
-                        if city.lower() not in contrib_city:
-                            continue
-                    
-                    if state and contrib_state:
-                        if state.upper() != contrib_state:
-                            continue
-                    
-                    results.append({
-                        "recipient": rec["committee"]["name"],
-                        "amount": rec["contribution_receipt_amount"],
-                        "date": rec["contribution_receipt_date"],
-                        "contributor_city": rec.get("contributor_city"),
-                        "contributor_state": rec.get("contributor_state"),
-                        "contributor_zip": rec.get("contributor_zip"),
-                        "source": "FEC"
-                    })
-                return results
-        except: pass
-        return []
-
-    def search_opensecrets(self, first, last):
-        if not OPENSECRETS_API_KEY: return {}
-        params = {"method":"indiv","name":f'"{first} {last}"',"output":"json","apikey":OPENSECRETS_API_KEY}
-        try:
-            r = requests.get(self.os_url, params=params, timeout=10)
-            if r.ok:
-                return {"opensecrets_summary": r.json(), "source": "OpenSecrets"}
-        except: pass
-        return {}
-
-    def search_followthemoney(self, first, last, state=None):
-        if not FOLLOWTHEMONEY_KEY: return []
-        try:
-            url = "https://api.followthemoney.org/search"
-            params = {
-                "query": f'"{first} {last}"',
-                "type": "contributors",
-                "apikey": FOLLOWTHEMONEY_KEY
-            }
-            if state: params["state"] = state
-            r = requests.get(url, params=params, timeout=10)
-            if r.ok:
-                return r.json().get("results", [])
-        except: pass
-        return []
-
-    def search_irs_527(self, first, last):
-        try:
-            params = {"q": f'"{first} {last}"', "format": "json"}
-            r = requests.get(self.propublica_527_url, params=params, timeout=10)
-            if r.ok:
-                return r.json().get("organizations", [])
-        except: pass
-        return []
-
-    def search_guidestar(self, first, last):
-        if not GUIDESTAR_API_KEY: return {}
-        return {"status": "Not implemented", "source": "Guidestar"}
-
-    def search_foundation_center(self, first, last):
-        if not FOUNDATION_CENTER_KEY: return {}
-        return {"status": "Not implemented", "source": "Foundation Center"}
-
-    def search_propublica_nonprofit(self, first, last, city=None, state=None):
-        try:
-            url = "https://projects.propublica.org/nonprofits/api/v2/search.json"
-            query = f'"{first} {last}"'
-            if city:
-                query += f' "{city}"'
-            if state:
-                query += f' "{state}"'
-            
-            params = {"q": query}
-            r = requests.get(url, params=params, timeout=10)
-            if r.ok:
-                return r.json().get("organizations", [])
-        except: pass
-        return []
-
-    def validate_email_debounce(self, email):
-        if not DEBOUNCE_API_KEY or not email: return {}
-        try:
-            params = {"api": DEBOUNCE_API_KEY, "email": email}
-            r = requests.get(f"{self.debounce_url}validate", params=params, timeout=10)
-            if r.ok:
-                return r.json()
-        except: pass
-        return {}
-
-    def search_intelius(self, first, last, city=None, state=None):
-        if not INTELIUS_API_KEY: return {}
-        return {"status": "Not implemented", "source": "Intelius"}
-
-    def search_relsci(self, first, last):
-        if not RELSCI_API_KEY: return {}
-        return {"status": "Not implemented", "source": "RelSci"}
-
-    def search_rocketreach(self, first, last, company=None):
-        if not ROCKETREACH_API_KEY: return {}
-        try:
-            headers = {"Api-Key": ROCKETREACH_API_KEY}
-            params = {"name": f'"{first} {last}"'}
-            if company: params["current_employer"] = company
-            r = requests.get(self.rocketreach_url, params=params, headers=headers, timeout=10)
-            if r.ok:
-                return r.json()
-        except: pass
-        return {}
-
-    def search_wealthx(self, first, last):
-        if not WEALTHX_API_KEY: return {}
-        return {"status": "Not implemented", "source": "WealthX"}
-
-    def search_windfall(self, first, last):
-        if not WINDFALL_API_KEY: return {}
-        return {"status": "Not implemented", "source": "Windfall"}
-
-    def search_lexisnexis(self, first, last):
-        if not LEXISNEXIS_API_KEY: return {}
-        return {"status": "Not implemented", "source": "LexisNexis"}
-
-    def search_inside_philanthropy(self, first, last, city=None, state=None):
-        query = f'"{first} {last}" site:insidephilanthropy.com'
-        if city and state:
-            query += f' "{city}" "{state}"'
-        elif state:
-            query += f' "{state}"'
-        return self.search_google(query, num=5)
-
-    def search_chronicle_philanthropy(self, first, last, city=None, state=None):
-        query = f'"{first} {last}" site:philanthropy.com'
-        if city and state:
-            query += f' "{city}" "{state}"'
-        elif state:
-            query += f' "{state}"'
-        return self.search_google(query, num=5)
-
-    def search_pacer(self, first, last):
-        if not PACER_API_KEY: return {}
-        return {"status": "Not implemented", "source": "PACER"}
-
-    def search_sec_edgar(self, first, last):
-        try:
-            params = {
-                "action": "getcompany",
-                "owner": "include",
-                "output": "xml",
-                "count": "10",
-                "company": f'"{first} {last}"'
-            }
-            r = requests.get(self.sec_edgar_url, params=params, timeout=10)
-            if r.ok:
-                return {"raw_data": r.text, "source": "SEC EDGAR"}
-        except: pass
-        return {}
-
-    def search_pitchbook(self, first, last):
-        if not PITCHBOOK_API_KEY: return {}
-        return {"status": "Not implemented", "source": "Pitchbook"}
-
-    def search_google(self, query, num=5):
-        if not GOOGLE_API_KEY or not GOOGLE_CSE_ID: 
-            # Return mock data for testing when Google API is not available
-            return [{
-                "title": f"Search result for {query}",
-                "link": "https://example.com",
-                "snippet": "Google API key not configured. Set GOOGLE_API_KEY and GOOGLE_CSE_ID environment variables."
-            }]
-        params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID, "q":query, "num":num}
-        try:
-            r = requests.get(self.cs_url, params=params, timeout=10)
-            if r.ok:
-                return [{"title":i["title"],"link":i["link"],"snippet":i["snippet"]} 
-                        for i in r.json().get("items",[])]
-        except: pass
-        return []
-
-    def search_scholar(self, name, max_results=5):
-        if not SCHOLARLY_AVAILABLE: return []
-        try:
-            if not name.startswith('"'):
-                name = f'"{name}"'
-            auth = next(scholarly.search_author(name), None)
-            if not auth: return []
-            scholarly.fill(auth)
-            pubs = auth.get("publications", [])[:max_results]
-            return [{"title":p["bib"].get("title"),"url":p.get("pub_url") or p.get("eprint_url"),
-                     "year":p["bib"].get("pub_year")} for p in pubs]
-        except: pass
-        return []
-
-    def fetch_irs_index(self, year):
-        try:
-            r = requests.get(IRS_INDEX_URL_TEMPLATE.format(year=year), timeout=15)
-            if r.ok:
-                return r.json().get(f"Filings{year}", [])
-        except: pass
-        return []
-
-    def find_irs_filings(self, first, last, city=None, state=None):
-        matches = []
-        full_name = f"{first} {last}"
-        name_variations = [
-            full_name,
-            full_name.upper(),
-            f"{last}, {first}",
-            f"{last} {first}"
-        ]
-        
-        print(f"    → Searching IRS filings for \"{full_name}\"" + (f" in {city}, {state}" if city and state else f" in {state}" if state else ""))
-        
-        for year in range(2018, 2026):
-            filings = self.fetch_irs_index(year)
-            if not filings:
-                continue
-                
-            for f in filings:
-                org = f.get("OrganizationName", "")
-                org_city = f.get("City", "")
-                org_state = f.get("State", "")
-                
-                if last.upper() in org.upper():
-                    if state and org_state:
-                        if state.upper() == org_state.upper():
-                            if city and org_city:
-                                if city.lower() in org_city.lower():
-                                    matches.append(f)
-                            else:
-                                matches.append(f)
-                    elif not state:
-                        matches.append(f)
-                    continue
-                
-                url = f.get("URL")
-                if not url: 
-                    continue
-                    
-                try:
-                    xml = requests.get(url, timeout=10).content
-                    root = ET.fromstring(xml)
-                    person_names = [e.text for e in root.findall(".//PersonName") if e.text]
-                    for name_var in name_variations:
-                        if name_var in person_names:
-                            f["_xml"] = xml
-                            matches.append(f)
-                            break
-                except: 
-                    pass
-                    
-        return matches
-
-    def parse_irs_filing(self, filing, first, last):
-        xml = filing.get("_xml") or requests.get(filing["URL"], timeout=10).content
-        root = ET.fromstring(xml)
-        name = f"{first} {last}"
-        for pn in root.findall(".//PersonName"):
-            if pn.text == name:
-                parent = pn.getparent() if hasattr(pn,'getparent') else pn.find("..")
-                role = parent.findtext(".//Title") or "N/A"
-                comp = parent.findtext(".//Compensation") or "0"
-                org = root.findtext(".//Filer/BusinessName/BusinessNameLine1") or filing["OrganizationName"]
-                mission = root.findtext(".//MissionDescription") or "N/A"
-                return {
-                    "organization": org,
-                    "ein": filing["EIN"],
-                    "role": role,
-                    "compensation": float(comp),
-                    "year": filing["TaxPeriod"][:4],
-                    "mission": mission,
-                    "source": f"IRS {filing['FormType']} {filing['TaxPeriod']}"
-                }
-        return None
-
-    # ——— MAIN RESEARCH METHOD ——————————————
-    def gather_data(self, first, last, email=None, city=None, state=None, zip_code=None):
-        """Use AI orchestration for deep research"""
-        
-        if not self.ai_orchestrator:
-            print("❌ AI Deep Research requires OpenAI API key")
-            print("Set your key: export OPENAI_API_KEY=''")
-            return None
-        
-        print(f"  🤖 Starting AI-orchestrated deep research...")
-        try:
-            result = self.ai_orchestrator.conduct_deep_research(
-                first, last, email, city, state, zip_code
-            )
-            return result
-        except Exception as e:
-            print(f"  ✗ AI orchestration failed: {str(e)}")
-            return None
-
-    # ——— REPORT GENERATION ——————————————
-    def generate_reports(self, data):
-        """Generate all three required reports in IHS style"""
-        if not data:
-            return None
-        
-        results = {}
-        
-        # 1. Summary Table
-        print("  → Generating Summary Table...")
-        summary_table = data.get('summary_table', '')
-        table_doc = Document()
-        
-        # Parse and add the markdown table content
-        for line in summary_table.split('\n'):
-            if line.strip():
-                if '**Summary Table' in line:
-                    table_doc.add_heading(line.replace('**', '').strip(), level=1)
-                elif '|' in line and '---' not in line:
-                    # This is a table row - we'll need to parse it properly
-                    table_doc.add_paragraph(line)
-                else:
-                    table_doc.add_paragraph(line)
-        
-        results['summary_table'] = self.save_and_convert(
-            table_doc, 
-            f"{data['name'].replace(' ', '_')}_Summary_Table"
-        )
-        
-        # 2. Two-Page Executive Summary  
-        print("  → Generating 2-Page Executive Summary...")
-        exec_doc = Document()
-        
-        # Format executive summary content
-        exec_content = data.get('executive_summary', '')
-        for paragraph in exec_content.split('\n'):
-            if paragraph.strip():
-                if paragraph.strip().startswith('**') and paragraph.strip().endswith('**'):
-                    # This is a heading
-                    heading_text = paragraph.strip().replace('**', '')
-                    if 'Executive Summary' in heading_text:
-                        exec_doc.add_heading(heading_text, level=1)
-                    else:
-                        exec_doc.add_heading(heading_text, level=2)
-                elif paragraph.strip().startswith('- '):
-                    # Bullet point
-                    exec_doc.add_paragraph(paragraph.strip(), style="List Bullet")
-                else:
-                    # Regular paragraph
-                    exec_doc.add_paragraph(paragraph.strip())
-        
-        results['executive_summary'] = self.save_and_convert(
-            exec_doc, 
-            f"{data['name'].replace(' ', '_')}_2pg_Executive_Summary"
-        )
-        
-        # 3. Full Narrative Donor Report
-        print("  → Generating Full Narrative Donor Report...")
-        full_doc = Document()
-        
-        # Format the full report content
-        full_content = data.get('final_report', '')
-        current_style = None
-        
-        for paragraph in full_content.split('\n'):
-            if paragraph.strip():
-                # Check if it's a heading (starts and ends with **)
-                if paragraph.strip().startswith('**') and paragraph.strip().endswith('**'):
-                    heading_text = paragraph.strip().replace('**', '')
-                    if 'Full Narrative Donor Report' in heading_text:
-                        full_doc.add_heading(heading_text, level=1)
-                    else:
-                        full_doc.add_heading(heading_text, level=2)
-                else:
-                    # Regular paragraph with potential formatting
-                    # Clean up any remaining ** formatting
-                    clean_para = paragraph.strip().replace('**', '')
-                    full_doc.add_paragraph(clean_para)
-        
-        results['full_report'] = self.save_and_convert(
-            full_doc, 
-            f"{data['name'].replace(' ', '_')}_Full_Narrative_Donor_Report"
-        )
-        
-        # Save raw JSON data
-        json_path = os.path.join("outputs", f"{data['name'].replace(' ', '_')}_raw_data.json")
-        with open(json_path, 'w') as f:
-            json.dump(data, f, indent=2)
-        results['json'] = json_path
-        
-        return results
-
-    def save_and_convert(self, doc, name):
-        os.makedirs("outputs", exist_ok=True)
-        docx_path = os.path.join("outputs", f"{name}.docx")
-        doc.save(docx_path)
-        pdf_path = docx_path.replace(".docx",".pdf")
-        if DOCX2PDF_AVAILABLE:
-            try: 
-                docx2pdf.convert(docx_path, pdf_path)
-            except: 
-                print(f"    ! PDF conversion failed for {name}")
-        return docx_path, pdf_path
-
-    def run_single(self, first, last, email=None, city=None, state=None, zip_code=None):
-        print(f"\n▶️  Researching {first} {last}...")
-        
-        if city and state:
-            print(f"  📍 Location: {city}, {state}")
-        elif state:
-            print(f"  📍 State: {state}")
+            return f"Error generating synthesis: {str(e)}"
+    
+    def _score_to_level(self, score):
+        """Convert numeric score to High/Medium/Low"""
+        if score >= 70:
+            return "High"
+        elif score >= 40:
+            return "Medium"
         else:
-            print("  📍 No location data")
-        
-        # Gather data using AI
-        data = self.gather_data(first, last, email, city, state, zip_code)
-        
-        if not data:
-            print(f"❌ Failed to research {first} {last}")
-            return None
-        
-        # Generate reports
-        print("  → Generating reports...")
-        results = self.generate_reports(data)
-        
-        if results:
-            final_confidence = data.get('confidence_scores', {}).get('identity', 'N/A')
-            print(f"✅  Completed research for {first} {last} (Confidence: {final_confidence}%)")
-        
-        return results
-
-    def process_csv(self, csv_path):
-        """Process multiple names from CSV file"""
-        results = []
-        
-        with open(csv_path, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            names = list(reader)
-        
-        print(f"\n📋 Processing {len(names)} names from CSV...")
-        
-        if names and len(names) > 0:
-            print(f"   📊 Columns found: {list(names[0].keys())}")
-        
-        for i, row in enumerate(names, 1):
-            # Handle various column name formats
-            full_name = None
-            for key in row.keys():
-                if 'full name' in key.lower() or key.strip() == 'Full Name':
-                    full_name = row[key]
-                    break
-            
-            if not full_name:
-                full_name = (row.get('Name') or row.get('name') or '').strip()
-            
-            if full_name:
-                full_name = full_name.strip()
-                name_parts = full_name.split()
-                if len(name_parts) >= 2:
-                    first = name_parts[0]
-                    last = name_parts[-1]
-                    
-                    if ' and ' in full_name.lower():
-                        first_part = full_name.split(' and ')[0].strip().split()
-                        if first_part:
-                            first = first_part[0]
-                        print(f"  Note: Multiple people in name: \"{full_name}\" - using {first} {last}")
-                elif len(name_parts) == 1:
-                    first = name_parts[0]
-                    last = ''
-                else:
-                    first = ''
-                    last = ''
-            else:
-                first = None
-                last = None
-                for key in row.keys():
-                    if 'first' in key.lower() and not first:
-                        first = row[key]
-                    if 'last' in key.lower() and not last:
-                        last = row[key]
-                
-                first = (first or '').strip()
-                last = (last or '').strip()
-            
-            # Get other fields
-            email = ''
-            city = ''
-            state = ''
-            zip_code = ''
-            
-            for key, value in row.items():
-                key_lower = key.lower()
-                if 'email' in key_lower:
-                    email = (value or '').strip()
-                elif 'city' in key_lower:
-                    city = (value or '').strip()
-                elif 'state' in key_lower:
-                    state = (value or '').strip()
-                elif 'zip' in key_lower:
-                    zip_code = (value or '').strip()
-            
-            print(f"\n[{i}/{len(names)}] Processing {first} {last}...")
-            if city or state:
-                print(f"  📍 Location data: {city}, {state}" if city else f"  📍 State: {state}")
-            
-            if not first and not last:
-                print(f"  ⚠️  Skipping row {i}: no name found")
-                continue
-            
-            if not last and first:
-                print(f"  ⚠️  Warning: Only first name '{first}' found - results may be limited")
-            
-            try:
-                result = self.run_single(first, last, email, city, state, zip_code)
-                if result:
-                    result['row'] = i
-                    result['name'] = f"{first} {last}"
-                    results.append(result)
-            except Exception as e:
-                print(f"  ❌ Error processing {first} {last}: {str(e)}")
-                results.append({
-                    'row': i,
-                    'name': f"{first} {last}",
-                    'error': str(e)
-                })
-            
-            time.sleep(1)  # Brief pause between requests
-        
-        # Generate batch summary
-        self._generate_batch_summary(results)
-        
-        return results
-
-    def _generate_batch_summary(self, results):
-        """Generate summary report for batch processing"""
-        os.makedirs("outputs", exist_ok=True)
-        
-        doc = Document()
-        doc.add_heading("Batch Processing Summary", level=1)
-        doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        doc.add_paragraph(f"Total processed: {len(results)}")
-        
-        successful = [r for r in results if 'error' not in r]
-        failed = [r for r in results if 'error' in r]
-        
-        doc.add_paragraph(f"Successful: {len(successful)}")
-        doc.add_paragraph(f"Failed: {len(failed)}")
-        
-        if successful:
-            doc.add_heading("Successfully Processed", level=2)
-            for r in successful:
-                doc.add_paragraph(f"• {r['name']} - Reports generated", style="List Bullet")
-        
-        if failed:
-            doc.add_heading("Failed Processing", level=2)
-            for r in failed:
-                doc.add_paragraph(f"• {r['name']} - Error: {r['error']}", style="List Bullet")
-        
-        doc.save(os.path.join("outputs", "batch_summary.docx"))
-
-
-# ——— CLI ——————————————————————————————————————————
-def main():
-    p = argparse.ArgumentParser(
-        description="AI Deep Research Tool - Uses OpenAI to orchestrate comprehensive donor research for IHS",
-        epilog="""
-        SETUP INSTRUCTIONS:
-        1. Set your OpenAI API key: export OPENAI_API_KEY='sk-your-key-here'
-        2. Set other API keys for better results (optional)
-        3. Create a data.csv file with donor names
-        4. Run: python spider.py
-        
-        GENERATED REPORTS:
-        - Summary Table: Key prospect information in table format
-        - 2-Page Executive Summary: Concise overview with giving probability
-        - Full Narrative Report: Comprehensive donor intelligence
+            return "Low"
+    
+    def generate_report(self, research_results: Dict) -> str:
         """
-    )
-    
-    # Single name mode
-    p.add_argument("--first", help="First name (for single lookup)")
-    p.add_argument("--last", help="Last name (for single lookup)")
-    p.add_argument("--email", help="Email address")
-    p.add_argument("--city", help="City")
-    p.add_argument("--state", help="State")
-    p.add_argument("--zip", dest="zip_code", help="ZIP code")
-    
-    # CSV mode
-    p.add_argument("--csv", help="Path to CSV file (default: data.csv)", default="data.csv")
-    p.add_argument("--single", action="store_true", help="Process single name instead of CSV")
-    
-    args = p.parse_args()
-    
-    # Check for OpenAI API key
-    if not OPENAI_API_KEY:
-        print("\n❌ OpenAI API key not found!")
-        print("\nTo use this AI Deep Research tool, you need an OpenAI API key.")
-        print("\nSet it up:")
-        print("1. Get your API key from: https://platform.openai.com/api-keys")
-        print("2. Set it in your terminal:")
-        print("   export OPENAI_API_KEY='sk-proj-G2AT8ZYNNTcc4he-'")
-        print("\nThen run this script again.")
-        return
-    
-    scraper = EnhancedDonorScraper()
-    
-    if not scraper.ai_orchestrator:
-        print("❌ Failed to initialize AI orchestrator")
-        return
-    
-    # Show active APIs
-    active_apis = ["OpenAI (Required)"]
-    if WEALTHENGINE_API_KEY: active_apis.append("WealthEngine")
-    if IWAVE_API_KEY: active_apis.append("iWave")
-    if FEC_API_KEY: active_apis.append("FEC")
-    if OPENSECRETS_API_KEY: active_apis.append("OpenSecrets")
-    if CLEARBIT_API_KEY: active_apis.append("Clearbit")
-    if PDL_API_KEY: active_apis.append("People Data Labs")
-    if GOOGLE_API_KEY: active_apis.append("Google")
-    if FOLLOWTHEMONEY_KEY: active_apis.append("FollowTheMoney")
-    
-    print(f"\n🔑 Active APIs: {', '.join(active_apis)}")
-    
-    # Warn about missing APIs
-    if not GOOGLE_API_KEY:
-        print("\n⚠️  Google API not configured - web searches will be limited")
-        print("   Set GOOGLE_API_KEY and GOOGLE_CSE_ID for better results")
-    
-    if len(active_apis) < 3:
-        print("\n💡 Tip: Add more API keys for deeper research:")
-        print("   - FEC_API_KEY for political giving data")
-        print("   - CLEARBIT_API_KEY for email enrichment")
-        print("   - PDL_API_KEY for comprehensive people data")
-    
-    print("\n🤖 AI Deep Research Engine Ready (IHS Donor Research Mode)")
-    print("   • AI orchestrates searches across all available databases")
-    print("   • Generates IHS-specific donor intelligence reports")
-    print("   • Creates executive summaries with giving probability")
-    print("   • Provides full narrative reports with strategic recommendations\n")
-    
-    if args.single and args.first and args.last:
-        # Single name lookup
-        out = scraper.run_single(
-            args.first, args.last,
-            email=args.email,
-            city=args.city,
-            state=args.state,
-            zip_code=args.zip_code
-        )
+        Generate a formatted HTML report from research results
+        """
+        person = research_results['person']
         
-        if out:
-            print("\n✅ Reports generated in ./outputs/:")
-            print(f"  • Summary Table: {out['summary_table'][0]}")
-            print(f"  • Executive Summary: {out['executive_summary'][0]}")
-            print(f"  • Full Narrative Report: {out['full_report'][0]}")
-            print(f"  • Raw Data: {out['json']}")
+        html = f"""
+        <html>
+        <head>
+            <title>IHS Donor Research Report - {person['first']} {person['last']}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+                h1, h2, h3 {{ color: #333; }}
+                .summary {{ background: #f5f5f5; padding: 20px; border-radius: 5px; margin: 20px 0; }}
+                .section {{ margin: 30px 0; }}
+                .finding {{ margin: 10px 0; padding: 10px; background: #fff; border-left: 3px solid #007bff; }}
+                .key-fact {{ display: inline-block; margin: 5px; padding: 5px 10px; background: #e9ecef; border-radius: 3px; }}
+                .search-history {{ font-size: 0.9em; color: #666; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #f2f2f2; }}
+            </style>
+        </head>
+        <body>
+            <h1>IHS Donor Research Report</h1>
+            <h2>{person['first']} {person['last']} - {person.get('city', '')}, {person.get('state', '')}</h2>
+            
+            <div class="summary">
+                <h3>IHS Probability Assessment</h3>
+                <p><strong>Overall Probability:</strong> {research_results['ihs_scores']['probability']}</p>
+                <p><strong>Financial Capacity:</strong> {self._score_to_level(research_results['ihs_scores']['scores']['financial_capacity'])}</p>
+                <p><strong>Philanthropic Inclination:</strong> {self._score_to_level(research_results['ihs_scores']['scores']['philanthropic_inclination'])}</p>
+                <p><strong>Ideological Alignment:</strong> {self._score_to_level(research_results['ihs_scores']['scores']['ideological_alignment'])}</p>
+                <p><strong>Total Findings:</strong> {research_results['total_findings']}</p>
+                <p><strong>Searches Conducted:</strong> {research_results['searches_conducted']}</p>
+                <p><strong>Research Duration:</strong> {research_results['duration_seconds']:.1f} seconds</p>
+            </div>
+            
+            <div class="section">
+                <h3>AI Synthesis</h3>
+                <div style="white-space: pre-wrap;">{research_results['synthesis']}</div>
+            </div>
+            
+            <div class="section">
+                <h3>Search History</h3>
+                <div class="search-history">
+                    {"<br>".join([f"• {s['name']} ({s.get('results_count', 0)} results)" for s in research_results['search_history']])}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+
+
+# ============================================
+# MAIN EXECUTION
+# ============================================
+
+async def main():
+    """Main execution function"""
+    
+    # Load environment variables
+    load_dotenv()
+    
+    # Check for required API key
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    if not openai_api_key:
+        print("❌ Error: OPENAI_API_KEY not found in environment variables")
+        print("Please set your OpenAI API key in .env file or environment")
+        return
+    
+    # Initialize scraper (import your actual scraper class)
+    try:
+        from donor_research_scraper import DonorResearchScraper
+        scraper = DonorResearchScraper()
+    except ImportError:
+        print("❌ Error: Could not import DonorResearchScraper")
+        print("Please ensure donor_research_scraper.py is in the same directory")
+        return
+    
+    # Initialize orchestrator
+    orchestrator = AIDeepResearchOrchestrator(scraper, openai_api_key)
+    
+    # Get person to research from command line or use default
+    if len(sys.argv) > 1:
+        first_name = sys.argv[1]
+        last_name = sys.argv[2] if len(sys.argv) > 2 else ""
+        city = sys.argv[3] if len(sys.argv) > 3 else ""
+        state = sys.argv[4] if len(sys.argv) > 4 else ""
     else:
-        # Process CSV file
-        csv_file = args.csv
-        
-        if not os.path.exists(csv_file):
-            if csv_file == "data.csv":
-                print(f"❌ No 'data.csv' file found")
-                print(f"\nCreate a CSV file with one of these formats:")
-                print("\nFormat 1:")
-                print("  Full Name, City, State, Email")
-                print("  John Smith, Boston, MA, john@example.com")
-                print("\nFormat 2:")
-                print("  first_name, last_name, city, state, email")
-                print("  John, Smith, Boston, MA, john@example.com")
-            else:
-                print(f"❌ CSV file not found: {csv_file}")
-            return
-        
-        print(f"\n📄 Processing: {csv_file}")
-        results = scraper.process_csv(csv_file)
-        
-        print(f"\n✅ Batch processing complete!")
-        print(f"Reports saved in ./outputs/")
+        # Default person for testing
+        print("\nNo person specified. Usage: python spider_st.py <first> <last> <city> <state>")
+        print("Using default test person...")
+        first_name = "John"
+        last_name = "Smith"
+        city = "New York"
+        state = "NY"
     
-    print(f"\n📊 Research complete")
+    # Create person dict
+    person = {
+        "first": first_name,
+        "last": last_name,
+        "city": city,
+        "state": state
+    }
+    
+    # Run research
+    print(f"\n{'='*60}")
+    print(f"IHS DONOR RESEARCH SYSTEM")
+    print(f"{'='*60}")
+    
+    try:
+        # Conduct deep research (20 searches for IHS mode)
+        results = await orchestrator.research_person_deep(person, max_searches=20)
+        
+        # Generate HTML report
+        report_html = orchestrator.generate_report(results)
+        
+        # Save report
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_filename = f"ihs_report_{person['last']}_{person['first']}_{timestamp}.html"
+        
+        with open(report_filename, 'w') as f:
+            f.write(report_html)
+        
+        print(f"\n📄 Report saved to: {report_filename}")
+        
+        # Also save raw JSON results
+        json_filename = f"ihs_data_{person['last']}_{person['first']}_{timestamp}.json"
+        with open(json_filename, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        
+        print(f"📊 Raw data saved to: {json_filename}")
+        
+    except Exception as e:
+        print(f"\n❌ Error during research: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    main()
+    # Run the async main function
+    asyncio.run(main())
