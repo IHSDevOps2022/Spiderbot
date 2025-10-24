@@ -295,8 +295,8 @@ class DeepConnectionFinder:
             log(f"  ! Could not read inner circle CSV")
             return
         
-        if "Full_Name" not in self.df.columns and "First" in self.df.columns and "Last" in self.df.columns:
-            self.df["Full_Name"] = (self.df["First"].fillna("") + " " + self.df["Last"].fillna("")).str.strip()
+        # Don't pre-construct Full_Name - let _construct_member_name() handle it properly
+        # (Old code only used First + Last, missing Middle names/initials)
     
     def _construct_member_name(self, member: Dict) -> str:
         """Construct full member name including middle name/initial"""
