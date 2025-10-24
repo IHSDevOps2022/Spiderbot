@@ -730,7 +730,6 @@ def render_enhanced_partner_profile(profile: Dict, out_dir="outputs") -> str:
     # Main profile table
     table_data = [
         ("Name", name),
-        ("Photo", "[Photo placeholder]"),
         ("Contact Info (Address)", f"{p.get('city','')}, {p.get('state','')}"),
         ("Salesforce Link", "https://theihs.lightning.force.com/lightning/r/Contact/[ID]/view"),
         ("Date of Birth", structured.get("date_of_birth", "TBD")),
@@ -740,11 +739,15 @@ def render_enhanced_partner_profile(profile: Dict, out_dir="outputs") -> str:
         ("Previous Positions", structured.get("previous_positions", "TBD")),
         ("Foundation and Nonprofit\nBoard Memberships", structured.get("board_memberships", "TBD")),
         ("Other Affiliations", structured.get("other_affiliations", "TBD")),
-        ("Net Worth/Giving\nCapacity", profile.get("giving_capacity", "TBD")),
+        ("Political Affiliation", structured.get("political_affiliation", "TBD")),
+        ("Political Giving", structured.get("political_giving", "TBD")),
+        ("Net Worth/Giving\nCapacity", structured.get("estimated_net_worth", "TBD")),
+        ("Real Estate & Properties", structured.get("real_estate", "TBD")),
+        ("Personal Interests", structured.get("personal_interests", "TBD")),
+        ("Geographic Ties", structured.get("geographic_ties", "TBD")),
         ("Philanthropic Interests", structured.get("philanthropic_interests", "TBD")),
         ("Relevant Gifts", "TBD - Requires manual research"),
-        ("Other Giving History", format_political_summary(political)),
-        ("Publications", structured.get("publications", "TBD"))
+        ("Other Giving History", format_political_summary(political))
     ]
 
     table = doc.add_table(rows=len(table_data), cols=2)
@@ -821,6 +824,12 @@ def render_enhanced_partner_profile(profile: Dict, out_dir="outputs") -> str:
                         detail = ev['detail'][:300]
                         source = ev.get('source', '')
                         
+                        # Handle source being a list or string
+                        if isinstance(source, list):
+                            source = ', '.join(str(s) for s in source if s)
+                        elif not isinstance(source, str):
+                            source = str(source) if source else ''
+                        
                         # Format as citation
                         ev_run = evidence_para.add_run(f"  - {ev_type}: {detail}")
                         if source:
@@ -880,16 +889,34 @@ def render_enhanced_partner_profile(profile: Dict, out_dir="outputs") -> str:
     
     # From main research findings
     for finding in profile.get('findings', []):
-        url = finding.get('link', '').strip()
-        if url and url.startswith('http'):
-            all_sources.add(url)
+        url = finding.get('link', '')
+        if isinstance(url, str):
+            url = url.strip()
+            if url and url.startswith('http'):
+                all_sources.add(url)
+        elif isinstance(url, list):
+            # Handle list of URLs
+            for u in url:
+                if isinstance(u, str) and u.strip().startswith('http'):
+                    all_sources.add(u.strip())
     
     # From connection evidence
     for conn in connections:
         for ev in conn.get('evidence', []):
-            source = ev.get('source', '').strip()
-            if source and source.startswith('http'):
-                all_sources.add(source)
+            source = ev.get('source', '')
+            
+            # Handle different types of source data
+            if isinstance(source, str):
+                source = source.strip()
+                if source and source.startswith('http'):
+                    all_sources.add(source)
+            elif isinstance(source, list):
+                # Source is a list of URLs
+                for s in source:
+                    if isinstance(s, str):
+                        s = s.strip()
+                        if s and s.startswith('http'):
+                            all_sources.add(s)
     
     # Sort and display
     sorted_sources = sorted(list(all_sources))
@@ -1339,15 +1366,20 @@ Write the comprehensive wealth and giving capacity analysis now:"""
 
 Return ONLY valid JSON with these fields. Be specific and detailed:
 {{
-    "date_of_birth": "Full date or year if available, otherwise 'TBD'",
-    "education": "List all degrees with institutions (e.g., 'Bachelor's Degree: Harvard University, History; Master's Degree: NYU')",
+    "date_of_birth": "Full date, year, or age (e.g., 'January 15, 1950' or 'Age 74' or '1950'). Use 'TBD' if not found.",
+    "education": "List all degrees with institutions (e.g., 'Bachelor's Degree: Harvard University, History; MBA: Stanford')",
     "current_position": "Current role(s) with company names (e.g., 'CEO of Company X, Board Chair of Organization Y')",
     "previous_positions": "Detailed list of previous major roles with companies (e.g., 'CEO of Company A (2010-2020); VP at Company B (2005-2010)')",
     "board_memberships": "All nonprofit and foundation board positions, current and past",
-    "other_affiliations": "Corporate boards, advisory roles, professional associations",
-    "family": "Spouse name and occupation, children, other family details if publicly available",
-    "publications": "Books, articles, major writings with titles and years",
-    "philanthropic_interests": "Specific causes, areas of focus in philanthropy"
+    "other_affiliations": "Corporate boards, advisory roles, professional associations, civic organizations",
+    "family": "Spouse name and background/occupation, children and their info, parents if relevant (e.g., 'Married to Barbara Smith (former state legislator); two adult children')",
+    "philanthropic_interests": "Specific causes, charitable organizations supported, donor-advised funds, foundation involvement",
+    "political_affiliation": "Political party (Republican/Democrat/Independent/Libertarian) or political leaning. Use 'TBD' if unclear.",
+    "political_giving": "Major political donations, PAC contributions, political organizations supported, political network connections",
+    "real_estate": "Primary residence location, other properties, land holdings, investment properties (e.g., 'Primary residence: Sioux Falls, SD; Vacation home: Lake Okoboji, IA; Land development: Colorado')",
+    "personal_interests": "Hobbies, recreational activities, lifestyle interests (e.g., 'Sailing, skiing, outdoor sports')",
+    "estimated_net_worth": "Net worth range if mentioned, business valuation indicators, wealth indicators. If not explicitly stated, use phrases like 'High net worth indicated by...' or 'TBD'",
+    "geographic_ties": "Cities, states, or regions where they live, work, or have strong connections (e.g., 'Based in Phoenix, AZ; Operations in Nevada; Alumni network in Boston')"
 }}
 
 Research Findings:
@@ -1359,7 +1391,7 @@ Extract as much detail as possible. Use "TBD" only if truly not found. Return JS
             response = self.ai_client.chat.completions.create(
                 model=self.keys["OPENAI_MODEL"],
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=1500,  # Increased for detailed extraction
+                max_tokens=2500,  # Increased for comprehensive extraction with new fields
                 temperature=0.3
             )
             content = response.choices[0].message.content.strip()
@@ -1395,8 +1427,13 @@ Extract as much detail as possible. Use "TBD" only if truly not found. Return JS
             "board_memberships": "TBD",
             "other_affiliations": "TBD",
             "family": "TBD",
-            "publications": "TBD",
-            "philanthropic_interests": "TBD"
+            "philanthropic_interests": "TBD",
+            "political_affiliation": "TBD",
+            "political_giving": "TBD",
+            "real_estate": "TBD",
+            "personal_interests": "TBD",
+            "estimated_net_worth": "TBD",
+            "geographic_ties": "TBD"
         }
 
 # -----------------------------
