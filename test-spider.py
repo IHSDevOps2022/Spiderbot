@@ -754,11 +754,28 @@ def render_enhanced_partner_profile(profile: Dict, out_dir="outputs") -> str:
         row = table.rows[i]
         row.cells[0].text = label
         row.cells[0].paragraphs[0].runs[0].bold = True
+        
+        # Ensure value is a string (handle dict, list, None, etc.)
+        if isinstance(value, dict):
+            # If it's a dict, convert to JSON string
+            value = json.dumps(value, indent=2)
+        elif isinstance(value, list):
+            # If it's a list, join items
+            value = ", ".join(str(item) for item in value)
+        elif value is None:
+            value = "TBD"
+        else:
+            value = str(value)
+        
         row.cells[1].text = value
 
     # Biography section
     doc.add_heading("Biography", level=2)
-    bio_para = doc.add_paragraph(profile.get("biography", "Biography pending."))
+    biography = profile.get("biography", "Biography pending.")
+    # Ensure biography is a string
+    if not isinstance(biography, str):
+        biography = str(biography) if biography else "Biography pending."
+    bio_para = doc.add_paragraph(biography)
     
     # Political Giving Analysis (if significant)
     if political.get('total_given', 0) > 0:
@@ -853,6 +870,60 @@ def render_enhanced_partner_profile(profile: Dict, out_dir="outputs") -> str:
     metadata_para.add_run(f"Inner Circle Members Analyzed: {len(connections)}\n")
     strong_count = sum(1 for c in connections if c['connection_strength'] >= 50)
     metadata_para.add_run(f"Strong Connections Found: {strong_count}\n")
+
+    # CITATIONS PAGE - List all sources used
+    doc.add_page_break()
+    doc.add_heading("Citations and Sources", level=1)
+    
+    # Collect all unique URLs from findings
+    all_sources = set()
+    
+    # From main research findings
+    for finding in profile.get('findings', []):
+        url = finding.get('link', '').strip()
+        if url and url.startswith('http'):
+            all_sources.add(url)
+    
+    # From connection evidence
+    for conn in connections:
+        for ev in conn.get('evidence', []):
+            source = ev.get('source', '').strip()
+            if source and source.startswith('http'):
+                all_sources.add(source)
+    
+    # Sort and display
+    sorted_sources = sorted(list(all_sources))
+    
+    if sorted_sources:
+        doc.add_paragraph(f"Total unique sources consulted: {len(sorted_sources)}")
+        doc.add_paragraph()  # Spacing
+        
+        # Group sources by domain for better organization
+        from urllib.parse import urlparse
+        sources_by_domain = {}
+        for url in sorted_sources:
+            try:
+                domain = urlparse(url).netloc
+                if domain not in sources_by_domain:
+                    sources_by_domain[domain] = []
+                sources_by_domain[domain].append(url)
+            except:
+                if 'other' not in sources_by_domain:
+                    sources_by_domain['other'] = []
+                sources_by_domain['other'].append(url)
+        
+        # Display by domain
+        for domain in sorted(sources_by_domain.keys()):
+            if domain != 'other':
+                doc.add_heading(domain, level=3)
+            else:
+                doc.add_heading("Other Sources", level=3)
+            
+            for url in sources_by_domain[domain]:
+                para = doc.add_paragraph(style='List Bullet')
+                para.add_run(url)
+    else:
+        doc.add_paragraph("No external sources were cited in this research.")
 
     # Save document
     safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
@@ -1089,7 +1160,7 @@ INNER_CIRCLE_CSV=Inner_Circle.csv
         }
     
     def _generate_queries(self, first, last, city=None, state=None):
-        """Generate comprehensive search queries"""
+        """Generate comprehensive search queries matching PDF profile depth"""
         base = f'"{first} {last}"'
         geo = ""
         if city and state:
@@ -1098,39 +1169,95 @@ INNER_CIRCLE_CSV=Inner_Circle.csv
             geo = f' "{state}"'
         
         queries = [
+            # Core biographical and professional
             f'{base} site:linkedin.com/in',
-            f'{base} CEO OR founder OR president',
+            f'{base} biography career history',
+            f'{base} CEO OR founder OR president OR executive',
+            f'{base} current position occupation',
+            f'{base} previous positions employment history',
+            
+            # Education
+            f'{base} education university college degree',
+            f'{base} Harvard OR Yale OR Stanford OR MIT',
+            f'{base} MBA OR masters OR bachelor degree',
+            
+            # Board positions and affiliations
             f'{base} "board of directors"',
+            f'{base} board member OR director OR trustee',
+            f'{base} chairman OR chair',
+            f'{base} advisory board',
+            
+            # Nonprofit and philanthropy
             f'{base} nonprofit OR foundation',
-            f'{base} author OR book OR article',
-            f'{base} interview OR podcast',
-            f'{base} donation OR philanthropist',
-            f'{base} "net worth" OR wealth',
+            f'{base} philanthropist OR donation OR charitable',
+            f'{base} giving capacity OR donor',
+            f'{base} family foundation',
+            
+            # Publications and media
+            f'{base} author OR book OR article OR published',
+            f'{base} wrote OR co-authored',
+            f'{base} interview OR podcast OR speaking',
+            f'{base} quoted OR featured',
+            
+            # Wealth and business
+            f'{base} "net worth" OR wealth OR millionaire',
+            f'{base} investor OR investment',
+            f'{base} entrepreneur OR startup OR venture',
             f'{base} site:sec.gov',
-            f'{base} Harvard OR Yale OR Stanford',
+            f'{base} stock OR equity OR shares',
+            
+            # Professional connections
+            f'{base} worked with OR collaborated',
+            f'{base} mentor OR mentee',
+            f'{base} colleague OR partner',
+            f'{base} knows OR friends with',
+            
+            # Personal and family
+            f'{base} spouse OR wife OR husband OR family',
+            f'{base} married OR children',
+            
+            # Social media and online presence
+            f'{base} twitter OR social media',
+            f'{base} site:crunchbase.com',
+            f'{base} site:forbes.com OR site:bloomberg.com',
         ]
         
         return [q + geo for q in queries]
     
     def synthesize_biography(self, person: Dict, findings: List[Dict]) -> str:
-        """Generate biography using AI"""
+        """Generate comprehensive biography with detailed sections matching PDF profile"""
         if not self.ai_client:
             return "Biography synthesis requires OpenAI API key."
         
         person_name = f"{person['first']} {person.get('last', '')}"
-        prompt = f"""Based on research findings about {person_name}, 
-write a comprehensive 3-4 sentence biography covering their current role, expertise, and impact.
+        
+        # Prepare all findings as context
+        findings_text = "\n\n".join([
+            f"Source: {f.get('title', 'Unknown')}\n{f.get('snippet', '')}\nURL: {f.get('link', '')}"
+            for f in findings[:100]  # Use more findings for comprehensive profile
+        ])
+        
+        prompt = f"""You are creating a comprehensive partner profile for {person_name}. Based on the research findings below, write detailed sections covering:
 
-Research findings:
-{json.dumps(findings[:20], indent=2)}
+1. **Background and Education** - Educational history, degrees, institutions, formative experiences
+2. **Professional Leadership and Roles** - Current and previous positions, companies led, major accomplishments
+3. **Board Positions and Affiliations** - Corporate boards, nonprofit boards, advisory roles
+4. **Key Professional Relationships and Connections** - Mentors, colleagues, collaborators, notable associations
+5. **Interview History and Media Participation** - Notable interviews, podcasts, articles, speaking engagements
+6. **Personal Life and Philanthropy** - Family information (if public), philanthropic activities, civic engagement
 
-Write professionally in third person:"""
+Write in a narrative style similar to an executive profile. Be comprehensive and detailed, using specific examples, dates, company names, and quantifiable achievements where available. Each section should be 2-4 paragraphs.
+
+Research Findings:
+{findings_text}
+
+Write the comprehensive profile now, using clear section headers:"""
         
         try:
             response = self.ai_client.chat.completions.create(
                 model=self.keys["OPENAI_MODEL"],
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
+                max_tokens=4000,  # Much longer for detailed profile
                 temperature=0.7
             )
             return response.choices[0].message.content.strip()
@@ -1139,71 +1266,123 @@ Write professionally in third person:"""
             return "Biography synthesis failed."
     
     def synthesize_giving_capacity(self, person: Dict, findings: List[Dict], political: Dict) -> str:
-        """Generate giving capacity analysis using AI"""
+        """Generate comprehensive giving capacity analysis matching PDF depth"""
         if not self.ai_client:
             return "Giving capacity analysis requires OpenAI API key."
         
         person_name = f"{person['first']} {person.get('last', '')}"
         total_given = political.get('total_given', 0)
-        prompt = f"""Analyze the giving capacity and estimated net worth of {person_name}.
+        
+        # Prepare detailed findings
+        findings_text = "\n\n".join([
+            f"Source: {f.get('title', '')}\nContent: {f.get('snippet', '')}"
+            for f in findings[:60]
+        ])
+        
+        prompt = f"""Analyze the giving capacity and estimated net worth of {person_name} in comprehensive detail, similar to a wealth profile.
 
-Research findings:
-{json.dumps(findings[:30], indent=2)}
+Include these sections:
 
-Political contributions: ${total_given:,.0f} total
+**Estimated Wealth:**
+- Analyze their career trajectory and positions held to estimate net worth
+- Identify executive compensation indicators (CEO roles, board positions, equity holdings)
+- Note any venture funding, company valuations, or public company stock
+- Mention specific dollar figures or ranges if available in sources
+- Overall estimate their net worth category (millions, tens of millions, etc.)
 
-Write a 2-3 paragraph analysis of their estimated wealth and giving capacity:"""
+**Lifestyle & Assets:**
+- Foundation assets if they have a family foundation
+- Real estate or other visible assets
+- Investment patterns and capital raising ability
+- Professional networks that indicate wealth level
+
+**Giving Capacity Analysis:**
+- What level of donations could they feasibly make (specific dollar ranges)
+- Pattern of their giving based on political contributions: ${total_given:,.0f} total
+- Comparison to typical donors at their wealth level
+- Growth potential if current ventures succeed
+- Strategic vs. splashy giving patterns
+
+Be specific with numbers, dates, company names, and funding amounts where available. Write 3-5 detailed paragraphs.
+
+Research Findings:
+{findings_text}
+
+Write the comprehensive wealth and giving capacity analysis now:"""
         
         try:
             response = self.ai_client.chat.completions.create(
                 model=self.keys["OPENAI_MODEL"],
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=800,
+                max_tokens=2000,  # Much longer for detailed analysis
                 temperature=0.7
             )
             return response.choices[0].message.content.strip()
-        except:
+        except Exception as e:
+            log(f"  ! AI error: {e}")
             return "Giving capacity analysis failed."
     
     def extract_structured_data(self, person: Dict, findings: List[Dict]) -> Dict:
-        """Extract structured data using AI"""
+        """Extract detailed structured data using AI"""
         if not self.ai_client:
             return self._default_structured_data()
         
         person_name = f"{person['first']} {person.get('last', '')}"
-        prompt = f"""Extract structured information about {person_name} from research findings.
+        
+        # Prepare findings with more context
+        findings_text = "\n\n".join([
+            f"Title: {f.get('title', 'Unknown')}\nContent: {f.get('snippet', '')}\nURL: {f.get('link', '')}"
+            for f in findings[:50]  # Use more findings
+        ])
+        
+        prompt = f"""Extract detailed structured information about {person_name} from the research findings below.
 
-Return ONLY valid JSON with these fields (use "TBD" if not found):
+Return ONLY valid JSON with these fields. Be specific and detailed:
 {{
-    "date_of_birth": "Date or year",
-    "education": "Degrees and schools",
-    "current_position": "Current role and company",
-    "previous_positions": "List of previous roles",
-    "board_memberships": "Nonprofit and foundation boards",
-    "other_affiliations": "Other organizations",
-    "family": "Spouse, children info",
-    "publications": "Books or articles",
-    "philanthropic_interests": "Causes supported"
+    "date_of_birth": "Full date or year if available, otherwise 'TBD'",
+    "education": "List all degrees with institutions (e.g., 'Bachelor's Degree: Harvard University, History; Master's Degree: NYU')",
+    "current_position": "Current role(s) with company names (e.g., 'CEO of Company X, Board Chair of Organization Y')",
+    "previous_positions": "Detailed list of previous major roles with companies (e.g., 'CEO of Company A (2010-2020); VP at Company B (2005-2010)')",
+    "board_memberships": "All nonprofit and foundation board positions, current and past",
+    "other_affiliations": "Corporate boards, advisory roles, professional associations",
+    "family": "Spouse name and occupation, children, other family details if publicly available",
+    "publications": "Books, articles, major writings with titles and years",
+    "philanthropic_interests": "Specific causes, areas of focus in philanthropy"
 }}
 
-Research findings:
-{json.dumps(findings[:30], indent=2)}
+Research Findings:
+{findings_text}
 
-JSON only:"""
+Extract as much detail as possible. Use "TBD" only if truly not found. Return JSON only:"""
         
         try:
             response = self.ai_client.chat.completions.create(
                 model=self.keys["OPENAI_MODEL"],
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=800,
+                max_tokens=1500,  # Increased for detailed extraction
                 temperature=0.3
             )
             content = response.choices[0].message.content.strip()
             if "{" in content and "}" in content:
                 json_str = content[content.index("{"):content.rindex("}")+1]
-                return json.loads(json_str)
-        except:
-            pass
+                data = json.loads(json_str)
+                
+                # Ensure all values are strings (not nested dicts or lists)
+                for key, value in data.items():
+                    if isinstance(value, dict):
+                        # Convert nested dict to readable string
+                        data[key] = json.dumps(value, indent=2)
+                    elif isinstance(value, list):
+                        # Convert list to comma-separated string
+                        data[key] = ", ".join(str(item) for item in value)
+                    elif value is None:
+                        data[key] = "TBD"
+                    else:
+                        data[key] = str(value)
+                
+                return data
+        except Exception as e:
+            log(f"      ! Structured extraction failed: {e}")
         
         return self._default_structured_data()
     
