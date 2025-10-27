@@ -1,73 +1,150 @@
 #!/usr/bin/env python3
 """
-IHS Deep Donor Research + Partner Profile Generator (Enhanced v5.0 - HYBRID)
-------------------------------------------------------------------------------
-Produces comprehensive donor profiles with AI-powered connection discovery to inner circle.
-Uses HYBRID approach: Google CSE finds evidence + OpenAI o1 analyzes connections.
+IHS Hybrid Donor Research System - NARRATIVE FORMAT EDITION
+------------------------------------------------------------
+Generates donor profiles in narrative prose format with deep biographical,
+career, and philanthropic research.
 
-SETUP REQUIRED:
-Create a file named 'spider.env' in the same directory with your API keys:
+OUTPUT FORMAT (10 SECTIONS):
+- Title: "[Name]: Donor Profile"
+- 1. Biographical Background & Education (narrative paragraphs)
+- 2. Career History & Business Leadership (narrative paragraphs)
+- 3. Philanthropic Activities & Causes Supported (narrative paragraphs)
+- 4. Political Donations & Ideological Leanings (narrative paragraphs)
+- 5. Connections (Inner Circle comparison - 357 members analyzed)
+- 6. Network & Board Affiliations (donor's own network and boards)
+- 7. Estimated Net Worth & Giving Capacity (narrative paragraphs)
+- 8. IHS Donor Probability Model Assessment (A-E-I-N-P-S framework in prose)
+- 9. Strategic Summary (Board-Level Briefing)
+- 10. Sources & Citations (comprehensive list of all research sources)
 
-    OPENAI_API_KEY=sk-your-openai-key-here
+Combines proven architecture with advanced features:
+- Deep biographical research (6 searches, 3-5 narrative paragraphs)
+- Deep career research (6 searches, 4-6 narrative paragraphs)
+- Deep philanthropic research (5 searches, 3-5 narrative paragraphs)
+- Systematic Inner Circle comparison (357 members)
+- Comprehensive source tracking (all URLs cited)
+- Caching system (saves 50% on API costs)
+- Retry logic (handles failures)
+- Confidence scoring (rates connection quality)
+- Test mode (processes only first donor)
+- Optimized for YOUR data format
+
+SETUP:
+Create spider.env with:
+    OPENAI_API_KEY=sk-your-key
     OPENAI_MODEL=gpt-4o
-    OPENAI_RESEARCH_MODEL=o1
-    GOOGLE_API_KEY=your-google-key-here
-    GOOGLE_CSE_ID=your-cse-id-here
+    GOOGLE_API_KEY=your-key
+    GOOGLE_CSE_ID=your-cse-id
     FEC_API_KEY=DEMO_KEY
-    CACHE_DIR=./cache
-    CACHE_TTL=86400
-    INNER_CIRCLE_CSV=Inner_Circle.csv
 
-HYBRID DEEP RESEARCH:
-1. Google CSE searches for actual evidence (articles, publications, events)
-2. OpenAI o1 analyzes search results to extract and structure connections
-3. Best results require BOTH API keys, but works with either
-
-DO NOT hardcode API keys in this script!
+USAGE:
+    python3 test-spider.py                    # Process all donors
+    python3 test-spider.py --test-mode        # Process ONLY first donor (for testing)
+    python3 test-spider.py --name "John Doe"  # Process specific donor
 """
 
-import os, re, sys, json, time, math, difflib, csv, zipfile, tempfile, hashlib
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+import os
+import re
+import sys
+import csv
+import json
+import time
+import math
+import hashlib
+import argparse
+import logging
+import warnings
+from datetime import datetime
+from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 from functools import wraps
+
 import requests
-import pandas as pd
 from dotenv import load_dotenv
 from docx import Document
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import openai
 
-# -----------------------------
-# Utilities
-# -----------------------------
+# Suppress urllib3 LibreSSL warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='urllib3')
 
-def log(msg: str):
-    """Safe logging that handles encoding issues"""
+# -------------------------
+# SETUP & CONFIG
+# -------------------------
+load_dotenv("spider.env")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4")
+
+# Support multiple Google API keys for higher rate limits
+# Format: GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, etc.
+GOOGLE_API_KEYS = []
+GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID", "")
+
+# Load all GOOGLE_API_KEY_N variables
+for i in range(1, 21):  # Support up to 20 keys
+    key = os.getenv(f"GOOGLE_API_KEY_{i}", "")
+    if key:
+        GOOGLE_API_KEYS.append(key)
+
+# Fallback to single GOOGLE_API_KEY if no numbered keys found
+if not GOOGLE_API_KEYS:
+    single_key = os.getenv("GOOGLE_API_KEY", "")
+    if single_key:
+        GOOGLE_API_KEYS.append(single_key)
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "google")
+FEC_API_KEY    = os.getenv("FEC_API_KEY", "")
+CACHE_DIR      = os.getenv("CACHE_DIR", "./cache")
+CACHE_TTL      = int(os.getenv("CACHE_TTL", "86400"))
+
+# Key rotation state
+_google_key_index = 0
+_google_key_exhausted = set()  # Track which keys hit rate limits
+
+def reset_google_keys():
+    """Reset exhausted keys tracking (call this daily or when quotas reset)"""
+    global _google_key_exhausted
+    _google_key_exhausted.clear()
+    log.info("Reset Google API key exhaustion tracking")
+
+try:
+    import openai
+    # Detect OpenAI library version
     try:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
-    except UnicodeEncodeError:
-        # Fallback to ASCII-safe version
-        safe_msg = msg.encode('ascii', 'replace').decode('ascii')
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {safe_msg}", flush=True)
+        # Try new API (1.0+)
+        OPENAI_CLIENT = openai.OpenAI(api_key=OPENAI_API_KEY)
+        OPENAI_VERSION = "new"
+    except AttributeError:
+        # Fall back to old API (0.28)
+        openai.api_key = OPENAI_API_KEY
+        OPENAI_CLIENT = None
+        OPENAI_VERSION = "old"
+except Exception:
+    openai = None
+    OPENAI_CLIENT = None
+    OPENAI_VERSION = None
 
-def clean_text(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    return re.sub(r"\s+", " ", str(s)).strip()
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+log = logging.getLogger("spider")
 
-# -----------------------------
-# Caching Layer
-# -----------------------------
+# Suppress OpenAI's verbose HTTP logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 
+# -------------------------
+# CACHING SYSTEM (from v5.3)
+# -------------------------
 class ResearchCache:
+    """Cache API results to save money and time"""
     def __init__(self, cache_dir: str = "./cache", ttl: int = 86400):
         self.cache_dir = cache_dir
         self.ttl = ttl
         os.makedirs(cache_dir, exist_ok=True)
     
-    def _get_cache_key(self, prefix: str, params: Dict) -> str:
+    def get_cache_key(self, prefix: str, params: Dict) -> str:
         param_str = json.dumps(params, sort_keys=True)
         hash_key = hashlib.md5(param_str.encode()).hexdigest()[:8]
         return f"{prefix}_{hash_key}"
@@ -76,17 +153,22 @@ class ResearchCache:
         ttl = ttl or self.ttl
         cache_file = os.path.join(self.cache_dir, f"{key}.json")
         
+        # Check if cached and still valid
         if os.path.exists(cache_file):
             mtime = os.path.getmtime(cache_file)
             if time.time() - mtime < ttl:
                 try:
                     with open(cache_file, 'r', encoding='utf-8') as f:
+                        log.debug(f"Cache HIT: {key}")
                         return json.load(f)
                 except:
                     pass
         
+        # Fetch fresh data
+        log.debug(f"Cache MISS: {key}")
         data = fetcher()
         
+        # Save to cache
         try:
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
@@ -95,11 +177,14 @@ class ResearchCache:
         
         return data
 
-# -----------------------------
-# Retry Logic
-# -----------------------------
+# Global cache instance
+cache = ResearchCache(CACHE_DIR, CACHE_TTL)
 
+# -------------------------
+# RETRY LOGIC (from v5.3)
+# -------------------------
 def retry_with_backoff(max_retries: int = 3, initial_wait: float = 1.0):
+    """Decorator to retry failed API calls with exponential backoff"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -108,1495 +193,1772 @@ def retry_with_backoff(max_retries: int = 3, initial_wait: float = 1.0):
                     return func(*args, **kwargs)
                 except Exception as e:
                     if attempt == max_retries - 1:
-                        log(f"  ! Final retry failed for {func.__name__}: {e}")
+                        log.warning(f"Final retry failed for {func.__name__}: {e}")
                         raise
                     wait = initial_wait * (2 ** attempt)
-                    log(f"  Retry {attempt + 1}/{max_retries} after {wait}s...")
+                    log.info(f"Retry {attempt + 1}/{max_retries} after {wait}s...")
                     time.sleep(wait)
             return None
         return wrapper
     return decorator
 
-# -----------------------------
-# API Clients
-# -----------------------------
-
-class GoogleCSE:
-    def __init__(self, api_key: str, cse_id: str, cache: Optional[ResearchCache] = None):
-        self.api_key = api_key
-        self.cse_id = cse_id
-        self.cache = cache or ResearchCache()
-        self.endpoint = "https://www.googleapis.com/customsearch/v1"
-
-    @retry_with_backoff(max_retries=3)
-    def query(self, q: str, num=10):
-        if not self.api_key or not self.cse_id:
-            return []
-        
-        cache_key = self.cache._get_cache_key("google", {"q": q, "num": num})
-        
-        def fetcher():
-            r = requests.get(self.endpoint, params={"key": self.api_key, "cx": self.cse_id, "q": q, "num": num}, timeout=15)
-            r.raise_for_status()
-            items = r.json().get("items", [])
-            out = []
-            for it in items:
-                out.append({
-                    "title": it.get("title",""),
-                    "link": it.get("link",""),
-                    "snippet": it.get("snippet",""),
-                    "displayLink": it.get("displayLink",""),
-                    "source": "google_cse",
-                    "q": q
-                })
-            return out
-        
-        return self.cache.get_or_fetch(cache_key, fetcher)
-
-class FECClient:
-    def __init__(self, api_key: str, cache: Optional[ResearchCache] = None):
-        self.api_key = api_key or "DEMO_KEY"
-        self.cache = cache or ResearchCache()
-        self.endpoint = "https://api.open.fec.gov/v1/schedules/schedule_a/"
-
-    @retry_with_backoff(max_retries=3)
-    def contributions(self, name: str, state: Optional[str] = None, per_page=50):
-        cache_key = self.cache._get_cache_key("fec", {"name": name, "state": state})
-        
-        def fetcher():
-            params = {"api_key": self.api_key, "contributor_name": name, "per_page": per_page}
-            if state:
-                params["contributor_state"] = state
-            
-            r = requests.get(self.endpoint, params=params, timeout=20)
-            r.raise_for_status()
-            rows = r.json().get("results", [])
-            out = []
-            for rec in rows:
-                out.append({
-                    "source": "fec",
-                    "committee": rec.get("committee", {}).get("name"),
-                    "amount": rec.get("contribution_receipt_amount"),
-                    "date": rec.get("contribution_receipt_date"),
-                    "employer": rec.get("contributor_employer"),
-                    "occupation": rec.get("contributor_occupation"),
-                    "recipient": rec.get("committee", {}).get("name"),
-                    "party": self._identify_party(rec.get("committee", {}).get("name", "")),
-                    "snippet": f"${rec.get('contribution_receipt_amount')} to {rec.get('committee',{}).get('name')}",
-                    "link": "https://www.fec.gov/data/"
-                })
-            return out
-        
-        return self.cache.get_or_fetch(cache_key, fetcher)
+# -------------------------
+# CSV LOADERS (fixed for YOUR format)
+# -------------------------
+def load_csv(path: str) -> List[Dict[str, str]]:
+    """Load CSV with automatic encoding detection and column name normalization"""
+    encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1', 'mac_roman']
     
-    def _identify_party(self, recipient: str) -> str:
-        recipient_lower = recipient.lower()
-        if any(term in recipient_lower for term in ['democrat', 'dnc', 'dccc', 'dscc', 'actblue']):
-            return 'Democrat'
-        elif any(term in recipient_lower for term in ['republican', 'rnc', 'nrcc', 'nrsc', 'winred']):
-            return 'Republican'
-        else:
-            return 'Other'
-    
-    def analyze_political_giving(self, contributions: List[Dict]) -> Dict:
-        analysis = {
-            'total_given': sum(c.get('amount', 0) for c in contributions),
-            'num_contributions': len(contributions),
-            'party_breakdown': defaultdict(float),
-            'top_recipients': [],
-            'giving_years': set(),
-            'pattern': 'Unknown',
-            'avg_contribution': 0
-        }
-        
-        if not contributions:
-            return analysis
-        
-        for contrib in contributions:
-            party = contrib.get('party', 'Other')
-            amount = contrib.get('amount', 0)
-            analysis['party_breakdown'][party] += amount
-            
-            date_str = contrib.get('date', '')
-            if date_str:
-                try:
-                    year = date_str[:4]
-                    analysis['giving_years'].add(year)
-                except:
-                    pass
-        
-        analysis['avg_contribution'] = analysis['total_given'] / len(contributions) if contributions else 0
-        
-        party_totals = dict(analysis['party_breakdown'])
-        if party_totals:
-            total = sum(party_totals.values())
-            dem_pct = party_totals.get('Democrat', 0) / total if total > 0 else 0
-            rep_pct = party_totals.get('Republican', 0) / total if total > 0 else 0
-            
-            if dem_pct > 0.9:
-                analysis['pattern'] = 'Consistent Democrat donor'
-            elif rep_pct > 0.9:
-                analysis['pattern'] = 'Consistent Republican donor'
-            elif dem_pct > 0 and rep_pct > 0:
-                analysis['pattern'] = 'Bipartisan donor'
-            else:
-                analysis['pattern'] = 'Independent/Third-party donor'
-        
-        recipient_totals = defaultdict(float)
-        for contrib in contributions:
-            recipient_totals[contrib.get('recipient', 'Unknown')] += contrib.get('amount', 0)
-        
-        analysis['top_recipients'] = sorted(
-            recipient_totals.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )[:5]
-        
-        return analysis
-
-# -----------------------------
-# ENHANCED INNER CIRCLE CONNECTION FINDER
-# -----------------------------
-
-class DeepConnectionFinder:
-    """
-    HYBRID connection finder that discovers donor-to-inner-circle relationships:
-    
-    STEP 1: Google CSE searches gather actual evidence (articles, publications, events)
-    STEP 2: OpenAI o1 analyzes search results to extract structured connections
-    
-    This approach ensures we find REAL connections (via Google) and intelligently
-    extract them (via o1), avoiding the hallucination problem of pure AI reasoning.
-    """
-    
-    def __init__(self, csv_path: str, google_cse: GoogleCSE, cache: ResearchCache, ai_client=None, model: str = "o1"):
-        self.path = csv_path
-        self.google = google_cse
-        self.cache = cache
-        self.ai_client = ai_client
-        self.model = model
-        self.df = None
-        self.load()
-    
-    def load(self):
-        if not os.path.exists(self.path):
-            log(f"  ! Inner circle CSV not found: {self.path}")
-            return
-        
-        for enc in ["utf-8", "utf-8-sig", "latin-1", "iso-8859-1", "cp1252"]:
-            try:
-                self.df = pd.read_csv(self.path, encoding=enc, on_bad_lines="skip")
-                log(f"  Loaded Inner Circle CSV with {enc} encoding ({len(self.df)} members)")
-                break
-            except Exception:
-                continue
-        
-        if self.df is None:
-            log(f"  ! Could not read inner circle CSV")
-            return
-        
-        # Don't pre-construct Full_Name - let _construct_member_name() handle it properly
-        # (Old code only used First + Last, missing Middle names/initials)
-    
-    def _construct_member_name(self, member: Dict) -> str:
-        """Construct full member name including middle name/initial"""
-        # Check for pre-constructed Full_Name
-        full_name = str(member.get("Full_Name", "")).strip()
-        if full_name:
-            return full_name
-        
-        # Build from First, Middle, Last
-        first = str(member.get("First", "")).strip() if pd.notna(member.get("First")) else ""
-        middle = str(member.get("Middle", "")).strip() if pd.notna(member.get("Middle")) else ""
-        last = str(member.get("Last", "")).strip() if pd.notna(member.get("Last")) else ""
-        
-        # Construct name with available parts
-        parts = []
-        if first:
-            parts.append(first)
-        if middle:
-            parts.append(middle)
-        if last:
-            parts.append(last)
-        
-        return " ".join(parts) if parts else ""
-    
-    def extract_donor_context(self, findings: List[Dict]) -> Dict:
-        """Extract contextual information about the donor to help validate search results"""
-        context = {
-            'companies': set(),
-            'positions': set(),
-            'locations': set(),
-            'keywords': set()
-        }
-        
-        for finding in findings[:50]:  # Check top findings
-            snippet = finding.get('snippet', '').lower()
-            title = finding.get('title', '').lower()
-            text = snippet + " " + title
-            
-            # Extract company names (CEO of X, founder of Y, etc.)
-            company_patterns = [
-                r'ceo of ([a-z\s]+)',
-                r'founder of ([a-z\s]+)',
-                r'president of ([a-z\s]+)',
-                r'at ([a-z\s]+) ',
-            ]
-            
-            for pattern in company_patterns:
-                matches = re.findall(pattern, text)
-                for match in matches:
-                    company = match.strip()
-                    if len(company) > 2 and len(company) < 50:
-                        context['companies'].add(company)
-            
-            # Extract positions
-            positions = ['ceo', 'founder', 'president', 'chairman', 'director', 'executive', 'chief']
-            for pos in positions:
-                if pos in text:
-                    context['positions'].add(pos)
-        
-        return context
-    
-    def validate_person_identity(self, search_result: Dict, donor: Dict, donor_context: Dict) -> Tuple[bool, float]:
-        """
-        RELAXED validation that a search result is about the correct donor.
-        Returns (is_valid, confidence_score)
-        """
-        snippet = search_result.get('snippet', '').lower()
-        title = search_result.get('title', '').lower()
-        text = snippet + " " + title
-        
-        confidence = 0.0
-        validation_points = []
-        
-        # Check location match
-        donor_city = donor.get('city', '')
-        donor_state = donor.get('state', '')
-        if donor_city and len(donor_city) > 2 and donor_city.lower() in text:
-            confidence += 0.25
-            validation_points.append(f"city:{donor_city}")
-        if donor_state and len(donor_state) > 1 and donor_state.lower() in text:
-            confidence += 0.15
-            validation_points.append(f"state:{donor_state}")
-        
-        # Check company/position context
-        for company in donor_context.get('companies', set()):
-            if company and len(company) > 3 and company in text:
-                confidence += 0.3
-                validation_points.append(f"company:{company}")
-                break
-        
-        for position in donor_context.get('positions', set()):
-            if position in text:
-                confidence += 0.15
-                validation_points.append(f"position:{position}")
-                break
-        
-        # RELAXED: Accept if we have ANY validation OR if it's a direct name match search
-        # This reduces false negatives
-        is_valid = (
-            confidence >= 0.2 or  # Lower threshold
-            len(validation_points) >= 1 or  # At least one validation point
-            '"' in search_result.get('q', '')  # Quoted name search (more specific)
-        )
-        
-        if is_valid:
-            log(f"      [OK] Validated (confidence: {confidence:.1f}, points: {', '.join(validation_points) if validation_points else 'direct search'})")
-        else:
-            log(f"      [SKIP] Low confidence (confidence: {confidence:.1f})")
-        
-        return is_valid, max(confidence, 0.3)  # Minimum confidence of 0.3 for valid results
-    
-    def deep_research_connection(self, donor: Dict, member: Dict, donor_context: Dict) -> List[Dict]:
-        """
-        Perform DEEP research using HYBRID approach:
-        1. Google CSE gathers actual evidence about both individuals
-        2. OpenAI o1 analyzes the evidence to extract connections
-        """
-        donor_name = f"{donor['first']} {donor.get('last', '')}"
-        
-        # Construct member name (including middle name/initial)
-        member_name = self._construct_member_name(member)
-        
-        if not member_name:
-            return []
-        
-        log(f"    Hybrid deep research: {donor_name} <-> {member_name}")
-        
-        # STEP 1: Gather actual evidence using Google CSE (if available)
-        search_results = []
-        
-        if self.google and self.google.api_key:
-            log(f"      [1/2] Gathering evidence via Google...")
-            
-            donor_last = donor.get('last', '')
-            member_last = str(member.get("Last", "")).strip() if pd.notna(member.get("Last")) else ""
-            
-            search_queries = [
-                f'"{donor_name}" "{member_name}"',
-                f'"{donor_name}" AND "{member_name}"',
-                f'"{donor_last}" "{member_last}"',
-                f'"{donor_name}" "{member_name}" author',
-                f'"{donor_name}" "{member_name}" article',
-                f'"{donor_name}" "{member_name}" conference',
-                f'"{donor_name}" "{member_name}" board',
-                f'"{donor_name}" "{member_name}" foundation',
-            ]
-            
-            for query in search_queries[:6]:  # Top 6 most relevant queries
-                try:
-                    results = self.google.query(query, num=5)
-                    for res in results[:3]:  # Top 3 results per query
-                        search_results.append({
-                            'title': res.get('title', ''),
-                            'snippet': res.get('snippet', ''),
-                            'link': res.get('link', ''),
-                            'query': query
-                        })
-                    time.sleep(0.3)
-                except Exception as e:
-                    log(f"        ! Search failed: {e}")
-                    continue
-            
-            log(f"        Collected {len(search_results)} search results")
-        else:
-            log(f"      [1/2] Google CSE not available, using AI reasoning only")
-        
-        # STEP 2: Use OpenAI o1 to analyze the evidence
-        if not self.ai_client:
-            log(f"      ! OpenAI client not available")
-            # Fallback to basic extraction if no AI
-            return self._basic_extraction(search_results)
-        
-        log(f"      [2/2] Analyzing evidence with OpenAI {self.model}...")
-        
-        # Prepare context
-        donor_info = f"""Donor: {donor_name}
-Location: {donor.get('city', 'Unknown')}, {donor.get('state', 'Unknown')}"""
-        
-        member_info = f"""Inner Circle Member: {member_name}
-Location: {member.get('City', 'Unknown')}, {member.get('State', 'Unknown')}
-Notes: {str(member.get('Notes', ''))[:500] if pd.notna(member.get('Notes')) else 'None'}"""
-        
-        # Format search results for AI
-        if search_results:
-            evidence_text = "\n\nSearch Results Found:\n"
-            for i, result in enumerate(search_results[:20], 1):  # Send top 20 results to AI
-                evidence_text += f"\n{i}. Title: {result['title']}\n"
-                evidence_text += f"   Snippet: {result['snippet']}\n"
-                evidence_text += f"   URL: {result['link']}\n"
-        else:
-            evidence_text = "\n\nNo search results available. Use your knowledge to identify potential connections."
-        
-        prompt = f"""Analyze the connection between these two individuals:
-
-{donor_info}
-
-{member_info}
-{evidence_text}
-
-Task: Extract ALL connections between {donor_name} and {member_name} from the search results above.
-
-For EACH connection you find, provide:
-- type: Connection category (e.g., "co_authorship", "shared_board", "shared_event", "co_occurrence")
-- detail: Specific description of the connection from the search results
-- source: The URL or publication name from the search results
-- confidence: Score from 0.0 to 1.0 based on evidence strength
-
-Important:
-- Only include connections that are explicitly mentioned in the search results
-- Use exact quotes and citations from the results
-- Be specific about what the connection is (e.g., "Co-authored article 'X' in Journal Y")
-- If search results mention them together, include that as a connection
-- Higher confidence for clear, direct connections (co-authorship, shared board)
-- Lower confidence for indirect mentions or weak associations
-
-Return ONLY a JSON array. If no connections found in results, return empty array [].
-
-Example format:
-[
-  {{
-    "type": "co_authorship",
-    "detail": "Co-authored article 'Economic Freedom and Innovation' published in Journal of Economics 2020",
-    "source": "https://example.com/article",
-    "confidence": 0.95
-  }}
-]
-
-JSON only:"""
-        
+    for encoding in encodings_to_try:
         try:
-            response = self.ai_client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            content = response.choices[0].message.content.strip()
-            
-            # Parse JSON response
-            if "[" in content and "]" in content:
-                json_start = content.index("[")
-                json_end = content.rindex("]") + 1
-                json_str = content[json_start:json_end]
-                evidence = json.loads(json_str)
+            with open(path, newline="", encoding=encoding) as f:
+                rows = list(csv.DictReader(f))
                 
-                log(f"        AI extracted {len(evidence)} connections")
-                
-                # Add query field for consistency
-                for ev in evidence:
-                    if 'query' not in ev:
-                        ev['query'] = f'AI analysis: {donor_name} <-> {member_name}'
-                
-                return evidence
-            else:
-                log(f"        No valid JSON response from AI")
-                return self._basic_extraction(search_results)
-                
-        except json.JSONDecodeError as e:
-            log(f"      ! Failed to parse AI response: {e}")
-            return self._basic_extraction(search_results)
-        except Exception as e:
-            log(f"      ! AI analysis failed: {e}")
-            return self._basic_extraction(search_results)
-    
-    def _basic_extraction(self, search_results: List[Dict]) -> List[Dict]:
-        """Fallback: Basic extraction if AI fails"""
-        evidence = []
-        for result in search_results[:10]:
-            snippet = result.get('snippet', '')
-            title = result.get('title', '')
-            if snippet or title:
-                connection_type = self.identify_connection_type(snippet + " " + title)
-                evidence.append({
-                    'type': connection_type,
-                    'detail': f"{title}: {snippet[:250]}",
-                    'source': result.get('link', ''),
-                    'confidence': 0.5,
-                    'query': result.get('query', '')
-                })
-        return evidence
-    
-    def identify_connection_type(self, text: str) -> str:
-        """Identify the type of connection based on text content"""
-        text_lower = text.lower()
-        
-        if any(word in text_lower for word in ['interview', 'interviewed', 'conversation', 'podcast', 'spoke with']):
-            return 'interview_conversation'
-        elif any(word in text_lower for word in ['co-author', 'co-wrote', 'together wrote', 'article by']):
-            return 'co_authorship'
-        elif any(word in text_lower for word in ['panel', 'conference', 'symposium', 'summit']):
-            return 'shared_event'
-        elif any(word in text_lower for word in ['board', 'director', 'trustee']):
-            return 'shared_board'
-        elif any(word in text_lower for word in ['dinner', 'meeting', 'lunch']):
-            return 'personal_meeting'
-        elif any(word in text_lower for word in ['foundation', 'organization', 'institute']):
-            return 'shared_organization'
-        else:
-            return 'co_occurrence'
-    
-    def find_all_connections(self, donor: Dict, findings: List[Dict]) -> List[Dict]:
-        """
-        Find connections between donor and ALL inner circle members.
-        Returns list sorted by connection strength.
-        """
-        if self.df is None or len(self.df) == 0:
-            log("  ! No inner circle members loaded")
-            return []
-        
-        log(f"\n{'='*60}")
-        log(f"DEEP CONNECTION RESEARCH: {donor['first']} {donor.get('last', '')}")
-        log(f"Analyzing connections to {len(self.df)} inner circle members...")
-        log(f"{'='*60}\n")
-        
-        # Extract donor context for validation
-        donor_context = self.extract_donor_context(findings)
-        log(f"  Donor context: {len(donor_context.get('companies', set()))} companies, "
-            f"{len(donor_context.get('positions', set()))} positions identified")
-        
-        connections = []
-        
-        for idx, member in self.df.iterrows():
-            # Construct member name (including middle name/initial)
-            member_name = self._construct_member_name(member)
-            
-            if not member_name:
-                log(f"\n[{idx+1}/{len(self.df)}] Skipping member with no name")
-                continue
-            
-            log(f"\n[{idx+1}/{len(self.df)}] Researching: {member_name}")
-            
-            # Perform deep research
-            evidence = self.deep_research_connection(donor, member, donor_context)
-            
-            # Calculate connection strength based on evidence quality
-            connection_strength = self.calculate_connection_strength(evidence)
-            
-            connections.append({
-                'member_name': member_name,
-                'member_id': member.get('Client ID', ''),
-                'member_city': member.get('City', ''),
-                'member_state': member.get('State', ''),
-                'member_notes': str(member.get('Notes', ''))[:300] if pd.notna(member.get('Notes')) else '',
-                'evidence': evidence,
-                'connection_strength': connection_strength,
-                'evidence_count': len(evidence)
-            })
-            
-            # Progress update
-            if (idx + 1) % 5 == 0:
-                strong = sum(1 for c in connections if c['connection_strength'] >= 50)
-                log(f"\n  Progress: {idx+1}/{len(self.df)} members analyzed ({strong} strong connections so far)")
-            
-            # Small delay between members
-            time.sleep(0.3)
-        
-        # Sort by connection strength
-        connections.sort(key=lambda x: x['connection_strength'], reverse=True)
-        
-        # Summary
-        strong_connections = [c for c in connections if c['connection_strength'] >= 50]
-        medium_connections = [c for c in connections if 30 <= c['connection_strength'] < 50]
-        
-        log(f"\n{'='*60}")
-        log(f"CONNECTION RESEARCH COMPLETE")
-        log(f"  Strong connections (>=50): {len(strong_connections)}")
-        log(f"  Medium connections (30-49): {len(medium_connections)}")
-        log(f"  Total evidence pieces: {sum(c['evidence_count'] for c in connections)}")
-        log(f"{'='*60}\n")
-        
-        return connections
-    
-    def calculate_connection_strength(self, evidence: List[Dict]) -> int:
-        """Calculate overall connection strength from evidence"""
-        if not evidence:
-            return 0
-        
-        # Weight by confidence and type
-        type_weights = {
-            'co_authorship': 50,
-            'interview_conversation': 45,
-            'shared_board': 45,
-            'shared_event': 40,
-            'personal_meeting': 40,
-            'organization_connection': 35,
-            'shared_organization': 30,
-            'co_occurrence': 20
-        }
-        
-        total_score = 0
-        seen_types = set()
-        
-        for ev in evidence:
-            ev_type = ev.get('type', 'co_occurrence')
-            confidence = ev.get('confidence', 0.5)
-            
-            base_weight = type_weights.get(ev_type, 20)
-            score = base_weight * confidence
-            
-            # Diminishing returns for same type
-            if ev_type in seen_types:
-                score *= 0.5
-            else:
-                seen_types.add(ev_type)
-            
-            total_score += score
-        
-        return min(100, int(total_score))
-
-# -----------------------------
-# Enhanced DOCX Output
-# -----------------------------
-
-def render_enhanced_partner_profile(profile: Dict, out_dir="outputs") -> str:
-    """
-    Render a comprehensive partner profile matching the IHS template
-    with enhanced connection section and proper citations.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    p = profile["person"]
-    name = f'{p["first"]} {p.get("last","")}'.strip()
-    structured = profile.get("structured_data", {})
-    political = profile.get("political_analysis", {})
-    connections = profile.get("inner_circle_connections", [])
-
-    doc = Document()
-    
-    # Title
-    title = doc.add_heading("Partner Profile", level=1)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Main profile table
-    table_data = [
-        ("Name", name),
-        ("Contact Info (Address)", f"{p.get('city','')}, {p.get('state','')}"),
-        ("Salesforce Link", "https://theihs.lightning.force.com/lightning/r/Contact/[ID]/view"),
-        ("Date of Birth", structured.get("date_of_birth", "TBD")),
-        ("Family", structured.get("family", "TBD")),
-        ("Education", structured.get("education", "TBD")),
-        ("Current Position or\nOccupation", structured.get("current_position", "TBD")),
-        ("Previous Positions", structured.get("previous_positions", "TBD")),
-        ("Foundation and Nonprofit\nBoard Memberships", structured.get("board_memberships", "TBD")),
-        ("Other Affiliations", structured.get("other_affiliations", "TBD")),
-        ("Political Affiliation", structured.get("political_affiliation", "TBD")),
-        ("Political Giving", structured.get("political_giving", "TBD")),
-        ("Net Worth/Giving\nCapacity", structured.get("estimated_net_worth", "TBD")),
-        ("Real Estate & Properties", structured.get("real_estate", "TBD")),
-        ("Personal Interests", structured.get("personal_interests", "TBD")),
-        ("Geographic Ties", structured.get("geographic_ties", "TBD")),
-        ("Philanthropic Interests", structured.get("philanthropic_interests", "TBD")),
-        ("Relevant Gifts", "TBD - Requires manual research"),
-        ("Other Giving History", format_political_summary(political))
-    ]
-
-    table = doc.add_table(rows=len(table_data), cols=2)
-    table.style = 'Light Grid Accent 1'
-    
-    for i, (label, value) in enumerate(table_data):
-        row = table.rows[i]
-        row.cells[0].text = label
-        row.cells[0].paragraphs[0].runs[0].bold = True
-        
-        # Ensure value is a string (handle dict, list, None, etc.)
-        if isinstance(value, dict):
-            # If it's a dict, convert to JSON string
-            value = json.dumps(value, indent=2)
-        elif isinstance(value, list):
-            # If it's a list, join items
-            value = ", ".join(str(item) for item in value)
-        elif value is None:
-            value = "TBD"
-        else:
-            value = str(value)
-        
-        row.cells[1].text = value
-
-    # Biography section
-    doc.add_heading("Biography", level=2)
-    biography = profile.get("biography", "Biography pending.")
-    # Ensure biography is a string
-    if not isinstance(biography, str):
-        biography = str(biography) if biography else "Biography pending."
-    bio_para = doc.add_paragraph(biography)
-    
-    # Political Giving Analysis (if significant)
-    if political.get('total_given', 0) > 0:
-        doc.add_heading("Political Contribution Analysis", level=2)
-        para = doc.add_paragraph()
-        para.add_run(f"Total Given: ${political.get('total_given', 0):,.0f}\n")
-        para.add_run(f"Number of Contributions: {political.get('num_contributions', 0)}\n")
-        para.add_run(f"Average Contribution: ${political.get('avg_contribution', 0):,.0f}\n")
-        para.add_run(f"Giving Pattern: {political.get('pattern', 'Unknown')}\n")
-        
-        if political.get('top_recipients'):
-            para.add_run("\nTop Recipients:\n")
-            for recipient, amount in political['top_recipients'][:5]:
-                para.add_run(f"  * {recipient}: ${amount:,.0f}\n")
-
-    # ENHANCED CONNECTIONS SECTION
-    doc.add_heading("Connections - Inner Circle Network", level=2)
-    
-    if connections:
-        strong_connections = [c for c in connections if c['connection_strength'] >= 50]
-        medium_connections = [c for c in connections if 30 <= c['connection_strength'] < 50]
-        
-        if strong_connections:
-            doc.add_heading("Strong Connections", level=3)
-            
-            for conn in strong_connections:
-                # Member name header
-                para = doc.add_paragraph()
-                run = para.add_run(f"* {conn['member_name']}")
-                run.bold = True
-                
-                # Location and strength
-                para.add_run(f" ({conn.get('member_city', '')}, {conn.get('member_state', '')})")
-                para.add_run(f" - Connection Strength: {conn['connection_strength']}/100")
-                
-                # Evidence with citations
-                if conn.get('evidence'):
-                    evidence_para = doc.add_paragraph()
-                    evidence_para.paragraph_format.left_indent = Inches(0.5)
-                    
-                    for ev in conn['evidence'][:5]:  # Top 5 pieces of evidence
-                        ev_type = ev['type'].replace('_', ' ').title()
-                        detail = ev['detail'][:300]
-                        source = ev.get('source', '')
-                        
-                        # Handle source being a list or string
-                        if isinstance(source, list):
-                            source = ', '.join(str(s) for s in source if s)
-                        elif not isinstance(source, str):
-                            source = str(source) if source else ''
-                        
-                        # Format as citation
-                        ev_run = evidence_para.add_run(f"  - {ev_type}: {detail}")
-                        if source:
-                            evidence_para.add_run(f"\n    Source: {source}\n")
+                # Normalize column names for YOUR data format
+                normalized_rows = []
+                for row in rows:
+                    normalized = {}
+                    for key, value in row.items():
+                        # Map your column names to standard format
+                        if key == 'First Name' or key == 'First':
+                            normalized['First'] = value
+                        elif key == 'Last Name' or key == 'Last':
+                            normalized['Last'] = value
+                        elif key in ['City', 'city']:
+                            normalized['City'] = value
+                        elif key in ['State', 'state']:
+                            normalized['State'] = value
+                        elif key == 'Middle':
+                            normalized['Middle'] = value
                         else:
-                            evidence_para.add_run("\n")
-                
-                # Add spacing
-                doc.add_paragraph()
-        
-        if medium_connections:
-            doc.add_heading("Medium Connections", level=3)
-            
-            for conn in medium_connections[:5]:  # Top 5 medium connections
-                para = doc.add_paragraph()
-                run = para.add_run(f"* {conn['member_name']}")
-                run.bold = True
-                para.add_run(f" ({conn.get('member_city', '')}, {conn.get('member_state', '')})")
-                para.add_run(f" - Connection Strength: {conn['connection_strength']}/100")
-                
-                if conn.get('evidence'):
-                    evidence_para = doc.add_paragraph()
-                    evidence_para.paragraph_format.left_indent = Inches(0.5)
+                            normalized[key] = value
                     
-                    for ev in conn['evidence'][:3]:  # Top 3 pieces
-                        ev_type = ev['type'].replace('_', ' ').title()
-                        detail = ev['detail'][:200]
-                        evidence_para.add_run(f"  - {ev_type}: {detail}\n")
-        
-        # Other connections summary
-        other_connections = [c for c in connections if c['connection_strength'] < 30 and c['evidence_count'] > 0]
-        if other_connections:
-            doc.add_heading("Other Potential Connections", level=3)
-            para = doc.add_paragraph()
-            para.add_run(f"Additional {len(other_connections)} inner circle members have minor or indirect connections. ")
-            para.add_run("See detailed CSV export for complete analysis.")
-    
-    else:
-        doc.add_paragraph("No connections identified through automated research. Manual review recommended.")
-
-    # Research Metadata
-    doc.add_heading("Research Metadata", level=2)
-    metadata_para = doc.add_paragraph()
-    metadata_para.add_run(f"Research Date: {profile['timestamp']}\n")
-    metadata_para.add_run(f"Total Sources Analyzed: {len(profile.get('findings', []))}\n")
-    metadata_para.add_run(f"Research Time: {profile.get('research_time', 0):.1f} seconds\n")
-    metadata_para.add_run(f"Inner Circle Members Analyzed: {len(connections)}\n")
-    strong_count = sum(1 for c in connections if c['connection_strength'] >= 50)
-    metadata_para.add_run(f"Strong Connections Found: {strong_count}\n")
-
-    # CITATIONS PAGE - List all sources used
-    doc.add_page_break()
-    doc.add_heading("Citations and Sources", level=1)
-    
-    # Collect all unique URLs from findings
-    all_sources = set()
-    
-    # From main research findings
-    for finding in profile.get('findings', []):
-        url = finding.get('link', '')
-        if isinstance(url, str):
-            url = url.strip()
-            if url and url.startswith('http'):
-                all_sources.add(url)
-        elif isinstance(url, list):
-            # Handle list of URLs
-            for u in url:
-                if isinstance(u, str) and u.strip().startswith('http'):
-                    all_sources.add(u.strip())
-    
-    # From connection evidence
-    for conn in connections:
-        for ev in conn.get('evidence', []):
-            source = ev.get('source', '')
-            
-            # Handle different types of source data
-            if isinstance(source, str):
-                source = source.strip()
-                if source and source.startswith('http'):
-                    all_sources.add(source)
-            elif isinstance(source, list):
-                # Source is a list of URLs
-                for s in source:
-                    if isinstance(s, str):
-                        s = s.strip()
-                        if s and s.startswith('http'):
-                            all_sources.add(s)
-    
-    # Sort and display
-    sorted_sources = sorted(list(all_sources))
-    
-    if sorted_sources:
-        doc.add_paragraph(f"Total unique sources consulted: {len(sorted_sources)}")
-        doc.add_paragraph()  # Spacing
-        
-        # Group sources by domain for better organization
-        from urllib.parse import urlparse
-        sources_by_domain = {}
-        for url in sorted_sources:
-            try:
-                domain = urlparse(url).netloc
-                if domain not in sources_by_domain:
-                    sources_by_domain[domain] = []
-                sources_by_domain[domain].append(url)
-            except:
-                if 'other' not in sources_by_domain:
-                    sources_by_domain['other'] = []
-                sources_by_domain['other'].append(url)
-        
-        # Display by domain
-        for domain in sorted(sources_by_domain.keys()):
-            if domain != 'other':
-                doc.add_heading(domain, level=3)
-            else:
-                doc.add_heading("Other Sources", level=3)
-            
-            for url in sources_by_domain[domain]:
-                para = doc.add_paragraph(style='List Bullet')
-                para.add_run(url)
-    else:
-        doc.add_paragraph("No external sources were cited in this research.")
-
-    # Save document
-    safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-    out_path = os.path.join(out_dir, f"{safe_name} - Partner Profile.docx")
-    doc.save(out_path)
-    return out_path
-
-def format_political_summary(political: Dict) -> str:
-    """Format political giving for table display"""
-    if not political or political.get('total_given', 0) == 0:
-        return "No political contributions found in FEC database"
-    
-    total = political.get('total_given', 0)
-    pattern = political.get('pattern', 'Unknown')
-    
-    summary = f"${total:,.0f} total donated; {pattern}"
-    
-    if political.get('top_recipients'):
-        top_recipient, top_amount = political['top_recipients'][0]
-        summary += f"; Top recipient: {top_recipient} (${top_amount:,.0f})"
-    
-    return summary
-
-# -----------------------------
-# Enhanced Research Orchestrator
-# -----------------------------
-
-class EnhancedResearcher:
-    def __init__(self):
-        # Load environment from spider.env
-        env_path = "spider.env"
-        if not os.path.exists(env_path):
-            log(f"WARNING: {env_path} not found. Create this file with your API keys.")
-            log("Example spider.env contents:")
-            log("  OPENAI_API_KEY=your_key_here")
-            log("  GOOGLE_API_KEY=your_key_here")
-            log("  GOOGLE_CSE_ID=your_cse_id_here")
-            
-            # Create a sample spider.env file
-            sample_env = """# IHS Donor Research API Configuration
-# Fill in your actual API keys below (remove the 'your_' placeholders)
-
-# OpenAI API key (required for AI synthesis and connection analysis)
-OPENAI_API_KEY=your_openai_key_here
-OPENAI_MODEL=gpt-4o
-OPENAI_RESEARCH_MODEL=o1
-
-# Google Custom Search Engine (required for gathering connection evidence)
-# Best results require BOTH Google and OpenAI
-GOOGLE_API_KEY=your_google_api_key_here
-GOOGLE_CSE_ID=your_google_cse_id_here
-
-# FEC API key (optional, DEMO_KEY has rate limits)
-FEC_API_KEY=DEMO_KEY
-
-# Cache settings
-CACHE_DIR=./cache
-CACHE_TTL=86400
-
-# Inner circle CSV file path
-INNER_CIRCLE_CSV=Inner_Circle.csv
-"""
-            try:
-                with open(env_path, 'w') as f:
-                    f.write(sample_env)
-                log(f"Created sample {env_path} file. Please edit it with your actual API keys.")
-            except:
-                pass
-        else:
-            load_dotenv(env_path)
-            log(f"Loaded environment from {env_path}")
-        
-        # API Keys - Load from spider.env (NO hardcoded keys!)
-        self.keys = {
-            "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
-            "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o"),
-            "OPENAI_RESEARCH_MODEL": os.getenv("OPENAI_RESEARCH_MODEL", "o1"),
-            "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY", ""),
-            "GOOGLE_CSE_ID": os.getenv("GOOGLE_CSE_ID", ""),
-            "FEC_API_KEY": os.getenv("FEC_API_KEY", "DEMO_KEY"),
-        }
-        
-        # Check for placeholder values
-        if "your_" in self.keys.get("OPENAI_API_KEY", "").lower():
-            log("WARNING: OPENAI_API_KEY appears to be a placeholder. Update spider.env with your actual key.")
-            self.keys["OPENAI_API_KEY"] = ""
-        if "your_" in self.keys.get("GOOGLE_API_KEY", "").lower():
-            log("WARNING: GOOGLE_API_KEY appears to be a placeholder. Update spider.env with your actual key.")
-            self.keys["GOOGLE_API_KEY"] = ""
-        
-        # Initialize cache
-        cache_dir = os.getenv("CACHE_DIR", "./cache")
-        cache_ttl = int(os.getenv("CACHE_TTL", "86400"))
-        self.cache = ResearchCache(cache_dir, cache_ttl)
-        
-        # Initialize clients
-        self.google = GoogleCSE(self.keys["GOOGLE_API_KEY"], self.keys["GOOGLE_CSE_ID"], self.cache)
-        self.fec = FECClient(self.keys["FEC_API_KEY"], self.cache)
-        
-        # Initialize AI synthesizer
-        from openai import OpenAI
-        self.ai_client = OpenAI(api_key=self.keys["OPENAI_API_KEY"]) if self.keys["OPENAI_API_KEY"] else None
-        
-        # Initialize connection finder
-        inner_circle_paths = [
-            os.getenv("INNER_CIRCLE_CSV", ""),
-            "Inner_Circle.csv",
-            "inner_circle.csv",
-        ]
-        
-        self.inner_circle_path = None
-        for path in inner_circle_paths:
-            if path and os.path.exists(path):
-                self.inner_circle_path = path
-                break
-        
-        if self.inner_circle_path:
-            # Deep research works best with both Google (for evidence) and OpenAI (for analysis)
-            # But can work with either alone
-            self.connection_finder = DeepConnectionFinder(
-                self.inner_circle_path,
-                self.google,
-                self.cache,
-                ai_client=self.ai_client,
-                model=self.keys.get("OPENAI_RESEARCH_MODEL", "o1")
-            )
-        else:
-            self.connection_finder = None
-
-    def research(self, person: Dict) -> Dict:
-        first, last = person["first"], person.get("last","")
-        city, state = person.get("city"), person.get("state")
-
-        log(f"\n{'='*70}")
-        log(f"COMPREHENSIVE DONOR RESEARCH: {first} {last}")
-        log(f"Location: {city or 'Unknown'}, {state or 'Unknown'}")
-        log(f"{'='*70}")
-        
-        start_time = time.time()
-        findings = []
-
-        # 1) Google searches
-        queries = self._generate_queries(first, last, city, state)
-        log(f"\n[1/5] Running {len(queries)} search queries...")
-        
-        for i, q in enumerate(queries):
-            if i > 0 and i % 10 == 0:
-                log(f"      Progress: {i}/{len(queries)} searches completed")
-            try:
-                findings.extend(self.google.query(q, num=10))
-            except Exception as e:
-                log(f"      Search failed: {e}")
-            time.sleep(0.25)
-        
-        log(f"      Collected {len(findings)} search results")
-
-        # 2) FEC contributions
-        log(f"\n[2/5] Searching FEC political contributions...")
-        try:
-            fec_results = self.fec.contributions(f"{first} {last}", state=state)
-            findings.extend(fec_results)
-            log(f"      Found {len(fec_results)} political contributions")
-        except Exception as e:
-            log(f"      FEC search failed: {e}")
-            fec_results = []
-        
-        political_analysis = self.fec.analyze_political_giving(fec_results)
-
-        # 3) Deduplicate
-        log(f"\n[3/5] Deduplicating findings...")
-        seen = set()
-        unique = []
-        for f in findings:
-            key = (f.get("link",""), f.get("title",""))
-            if key not in seen:
-                seen.add(key)
-                unique.append(f)
-        findings = unique
-        log(f"      {len(findings)} unique findings retained")
-
-        # 4) AI synthesis
-        log(f"\n[4/5] Synthesizing profile with AI...")
-        if self.ai_client:
-            try:
-                biography = self.synthesize_biography(person, findings)
-                giving_capacity = self.synthesize_giving_capacity(person, findings, political_analysis)
-                structured = self.extract_structured_data(person, findings)
-                log(f"      AI synthesis complete")
-            except Exception as e:
-                log(f"      AI synthesis error: {e}")
-                biography = "Biography synthesis failed."
-                giving_capacity = "Giving capacity analysis failed."
-                structured = self._default_structured_data()
-        else:
-            log(f"      AI synthesis disabled (no OpenAI key)")
-            biography = "AI synthesis requires OpenAI API key."
-            giving_capacity = "AI synthesis requires OpenAI API key."
-            structured = self._default_structured_data()
-
-        # 5) Deep connection research
-        log(f"\n[5/5] DEEP CONNECTION RESEARCH...")
-        inner_circle_connections = []
-        if self.connection_finder:
-            try:
-                inner_circle_connections = self.connection_finder.find_all_connections(person, findings)
-                log(f"      Connection research complete")
-            except Exception as e:
-                log(f"      Connection research failed: {e}")
-        else:
-            if not self.inner_circle_path:
-                log(f"      ! Inner circle CSV not found")
-            else:
-                log(f"      ! Connection finder not initialized")
-
-        elapsed = time.time() - start_time
-        
-        log(f"\n{'='*70}")
-        log(f"RESEARCH COMPLETE")
-        log(f"  Total time: {elapsed:.1f} seconds")
-        log(f"  Findings: {len(findings)}")
-        log(f"  Connections analyzed: {len(inner_circle_connections)}")
-        log(f"{'='*70}\n")
-
-        return {
-            "person": person,
-            "findings": findings,
-            "biography": biography,
-            "giving_capacity": giving_capacity,
-            "structured_data": structured,
-            "inner_circle_connections": inner_circle_connections,
-            "political_analysis": political_analysis,
-            "timestamp": datetime.utcnow().isoformat(),
-            "research_time": elapsed
-        }
-    
-    def _generate_queries(self, first, last, city=None, state=None):
-        """Generate comprehensive search queries matching PDF profile depth"""
-        base = f'"{first} {last}"'
-        geo = ""
-        if city and state:
-            geo = f' "{city}" "{state}"'
-        elif state:
-            geo = f' "{state}"'
-        
-        queries = [
-            # Core biographical and professional
-            f'{base} site:linkedin.com/in',
-            f'{base} biography career history',
-            f'{base} CEO OR founder OR president OR executive',
-            f'{base} current position occupation',
-            f'{base} previous positions employment history',
-            
-            # Education
-            f'{base} education university college degree',
-            f'{base} Harvard OR Yale OR Stanford OR MIT',
-            f'{base} MBA OR masters OR bachelor degree',
-            
-            # Board positions and affiliations
-            f'{base} "board of directors"',
-            f'{base} board member OR director OR trustee',
-            f'{base} chairman OR chair',
-            f'{base} advisory board',
-            
-            # Nonprofit and philanthropy
-            f'{base} nonprofit OR foundation',
-            f'{base} philanthropist OR donation OR charitable',
-            f'{base} giving capacity OR donor',
-            f'{base} family foundation',
-            
-            # Publications and media
-            f'{base} author OR book OR article OR published',
-            f'{base} wrote OR co-authored',
-            f'{base} interview OR podcast OR speaking',
-            f'{base} quoted OR featured',
-            
-            # Wealth and business
-            f'{base} "net worth" OR wealth OR millionaire',
-            f'{base} investor OR investment',
-            f'{base} entrepreneur OR startup OR venture',
-            f'{base} site:sec.gov',
-            f'{base} stock OR equity OR shares',
-            
-            # Professional connections
-            f'{base} worked with OR collaborated',
-            f'{base} mentor OR mentee',
-            f'{base} colleague OR partner',
-            f'{base} knows OR friends with',
-            
-            # Personal and family
-            f'{base} spouse OR wife OR husband OR family',
-            f'{base} married OR children',
-            
-            # Social media and online presence
-            f'{base} twitter OR social media',
-            f'{base} site:crunchbase.com',
-            f'{base} site:forbes.com OR site:bloomberg.com',
-        ]
-        
-        return [q + geo for q in queries]
-    
-    def synthesize_biography(self, person: Dict, findings: List[Dict]) -> str:
-        """Generate comprehensive biography with detailed sections matching PDF profile"""
-        if not self.ai_client:
-            return "Biography synthesis requires OpenAI API key."
-        
-        person_name = f"{person['first']} {person.get('last', '')}"
-        
-        # Prepare all findings as context
-        findings_text = "\n\n".join([
-            f"Source: {f.get('title', 'Unknown')}\n{f.get('snippet', '')}\nURL: {f.get('link', '')}"
-            for f in findings[:100]  # Use more findings for comprehensive profile
-        ])
-        
-        prompt = f"""You are creating a comprehensive partner profile for {person_name}. Based on the research findings below, write detailed sections covering:
-
-1. **Background and Education** - Educational history, degrees, institutions, formative experiences
-2. **Professional Leadership and Roles** - Current and previous positions, companies led, major accomplishments
-3. **Board Positions and Affiliations** - Corporate boards, nonprofit boards, advisory roles
-4. **Key Professional Relationships and Connections** - Mentors, colleagues, collaborators, notable associations
-5. **Interview History and Media Participation** - Notable interviews, podcasts, articles, speaking engagements
-6. **Personal Life and Philanthropy** - Family information (if public), philanthropic activities, civic engagement
-
-Write in a narrative style similar to an executive profile. Be comprehensive and detailed, using specific examples, dates, company names, and quantifiable achievements where available. Each section should be 2-4 paragraphs.
-
-Research Findings:
-{findings_text}
-
-Write the comprehensive profile now, using clear section headers:"""
-        
-        try:
-            response = self.ai_client.chat.completions.create(
-                model=self.keys["OPENAI_MODEL"],
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=4000,  # Much longer for detailed profile
-                temperature=0.7
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            log(f"  ! AI error: {e}")
-            return "Biography synthesis failed."
-    
-    def synthesize_giving_capacity(self, person: Dict, findings: List[Dict], political: Dict) -> str:
-        """Generate comprehensive giving capacity analysis matching PDF depth"""
-        if not self.ai_client:
-            return "Giving capacity analysis requires OpenAI API key."
-        
-        person_name = f"{person['first']} {person.get('last', '')}"
-        total_given = political.get('total_given', 0)
-        
-        # Prepare detailed findings
-        findings_text = "\n\n".join([
-            f"Source: {f.get('title', '')}\nContent: {f.get('snippet', '')}"
-            for f in findings[:60]
-        ])
-        
-        prompt = f"""Analyze the giving capacity and estimated net worth of {person_name} in comprehensive detail, similar to a wealth profile.
-
-Include these sections:
-
-**Estimated Wealth:**
-- Analyze their career trajectory and positions held to estimate net worth
-- Identify executive compensation indicators (CEO roles, board positions, equity holdings)
-- Note any venture funding, company valuations, or public company stock
-- Mention specific dollar figures or ranges if available in sources
-- Overall estimate their net worth category (millions, tens of millions, etc.)
-
-**Lifestyle & Assets:**
-- Foundation assets if they have a family foundation
-- Real estate or other visible assets
-- Investment patterns and capital raising ability
-- Professional networks that indicate wealth level
-
-**Giving Capacity Analysis:**
-- What level of donations could they feasibly make (specific dollar ranges)
-- Pattern of their giving based on political contributions: ${total_given:,.0f} total
-- Comparison to typical donors at their wealth level
-- Growth potential if current ventures succeed
-- Strategic vs. splashy giving patterns
-
-Be specific with numbers, dates, company names, and funding amounts where available. Write 3-5 detailed paragraphs.
-
-Research Findings:
-{findings_text}
-
-Write the comprehensive wealth and giving capacity analysis now:"""
-        
-        try:
-            response = self.ai_client.chat.completions.create(
-                model=self.keys["OPENAI_MODEL"],
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,  # Much longer for detailed analysis
-                temperature=0.7
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            log(f"  ! AI error: {e}")
-            return "Giving capacity analysis failed."
-    
-    def extract_structured_data(self, person: Dict, findings: List[Dict]) -> Dict:
-        """Extract detailed structured data using AI"""
-        if not self.ai_client:
-            return self._default_structured_data()
-        
-        person_name = f"{person['first']} {person.get('last', '')}"
-        
-        # Prepare findings with more context
-        findings_text = "\n\n".join([
-            f"Title: {f.get('title', 'Unknown')}\nContent: {f.get('snippet', '')}\nURL: {f.get('link', '')}"
-            for f in findings[:50]  # Use more findings
-        ])
-        
-        prompt = f"""Extract detailed structured information about {person_name} from the research findings below.
-
-Return ONLY valid JSON with these fields. Be specific and detailed:
-{{
-    "date_of_birth": "Full date, year, or age (e.g., 'January 15, 1950' or 'Age 74' or '1950'). Use 'TBD' if not found.",
-    "education": "List all degrees with institutions (e.g., 'Bachelor's Degree: Harvard University, History; MBA: Stanford')",
-    "current_position": "Current role(s) with company names (e.g., 'CEO of Company X, Board Chair of Organization Y')",
-    "previous_positions": "Detailed list of previous major roles with companies (e.g., 'CEO of Company A (2010-2020); VP at Company B (2005-2010)')",
-    "board_memberships": "All nonprofit and foundation board positions, current and past",
-    "other_affiliations": "Corporate boards, advisory roles, professional associations, civic organizations",
-    "family": "Spouse name and background/occupation, children and their info, parents if relevant (e.g., 'Married to Barbara Smith (former state legislator); two adult children')",
-    "philanthropic_interests": "Specific causes, charitable organizations supported, donor-advised funds, foundation involvement",
-    "political_affiliation": "Political party (Republican/Democrat/Independent/Libertarian) or political leaning. Use 'TBD' if unclear.",
-    "political_giving": "Major political donations, PAC contributions, political organizations supported, political network connections",
-    "real_estate": "Primary residence location, other properties, land holdings, investment properties (e.g., 'Primary residence: Sioux Falls, SD; Vacation home: Lake Okoboji, IA; Land development: Colorado')",
-    "personal_interests": "Hobbies, recreational activities, lifestyle interests (e.g., 'Sailing, skiing, outdoor sports')",
-    "estimated_net_worth": "Net worth range if mentioned, business valuation indicators, wealth indicators. If not explicitly stated, use phrases like 'High net worth indicated by...' or 'TBD'",
-    "geographic_ties": "Cities, states, or regions where they live, work, or have strong connections (e.g., 'Based in Phoenix, AZ; Operations in Nevada; Alumni network in Boston')"
-}}
-
-Research Findings:
-{findings_text}
-
-Extract as much detail as possible. Use "TBD" only if truly not found. Return JSON only:"""
-        
-        try:
-            response = self.ai_client.chat.completions.create(
-                model=self.keys["OPENAI_MODEL"],
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2500,  # Increased for comprehensive extraction with new fields
-                temperature=0.3
-            )
-            content = response.choices[0].message.content.strip()
-            if "{" in content and "}" in content:
-                json_str = content[content.index("{"):content.rindex("}")+1]
-                data = json.loads(json_str)
+                    # Combine First + Last into 'name' for backward compatibility
+                    first = (normalized.get('First') or '').strip()
+                    last = (normalized.get('Last') or '').strip()
+                    if first or last:
+                        normalized['name'] = f"{first} {last}".strip()
+                    
+                    normalized_rows.append(normalized)
                 
-                # Ensure all values are strings (not nested dicts or lists)
-                for key, value in data.items():
-                    if isinstance(value, dict):
-                        # Convert nested dict to readable string
-                        data[key] = json.dumps(value, indent=2)
-                    elif isinstance(value, list):
-                        # Convert list to comma-separated string
-                        data[key] = ", ".join(str(item) for item in value)
-                    elif value is None:
-                        data[key] = "TBD"
-                    else:
-                        data[key] = str(value)
-                
-                return data
+                log.info(f"Loaded {path} with {encoding} encoding ({len(normalized_rows)} rows)")
+                return normalized_rows
+        except UnicodeDecodeError:
+            continue
         except Exception as e:
-            log(f"      ! Structured extraction failed: {e}")
-        
-        return self._default_structured_data()
-    
-    def _default_structured_data(self):
-        return {
-            "date_of_birth": "TBD",
-            "education": "TBD",
-            "current_position": "TBD",
-            "previous_positions": "TBD",
-            "board_memberships": "TBD",
-            "other_affiliations": "TBD",
-            "family": "TBD",
-            "philanthropic_interests": "TBD",
-            "political_affiliation": "TBD",
-            "political_giving": "TBD",
-            "real_estate": "TBD",
-            "personal_interests": "TBD",
-            "estimated_net_worth": "TBD",
-            "geographic_ties": "TBD"
-        }
-
-# -----------------------------
-# Main CLI
-# -----------------------------
-
-def load_people_from_csv(path: str) -> List[Dict]:
-    """Load prospects from CSV"""
-    df = None
-    for enc in ["utf-8", "utf-8-sig", "latin-1", "iso-8859-1", "cp1252"]:
-        try:
-            df = pd.read_csv(path, encoding=enc, on_bad_lines="skip")
-            log(f"  Loaded CSV with {enc} encoding")
-            break
-        except:
+            log.warning(f"Error reading {path} with {encoding}: {e}")
             continue
     
-    if df is None:
-        raise RuntimeError(f"Could not read CSV: {path}")
+    # Last resort: try with error handling
+    try:
+        with open(path, newline="", encoding='utf-8', errors='ignore') as f:
+            log.warning(f"Reading {path} with UTF-8 and ignoring errors")
+            return list(csv.DictReader(f))
+    except Exception as e:
+        log.error(f"Failed to read {path}: {e}")
+        return []
 
-    people = []
-    for _, row in df.iterrows():
-        person = {"first":"", "last":"", "city":"", "state":""}
-        for col in df.columns:
-            val = str(row[col]).strip() if pd.notna(row[col]) else ""
-            cl = col.lower()
-            if "full" in cl and "name" in cl:
-                parts = val.split()
-                if len(parts)>=2:
-                    person["first"] = parts[0]
-                    person["last"] = " ".join(parts[1:])
-            elif cl == "first" or "first_name" in cl: 
-                person["first"] = person["first"] or val
-            elif cl == "last" or "last_name" in cl: 
-                person["last"] = person["last"] or val
-            elif cl == "city": 
-                person["city"] = val
-            elif cl == "state": 
-                person["state"] = val
-        if person["first"]:
-            people.append(person)
-    return people
-
-def main():
-    log("="*70)
-    log("IHS ENHANCED DONOR RESEARCH SYSTEM v5.0 (HYBRID)")
-    log("Deep Connection Analysis: Google Evidence + AI Reasoning")
-    log("="*70)
-    
-    r = EnhancedResearcher()
-
-    # System checks
-    log("\nSystem Configuration:")
-    
-    # API key status
-    log("\nAPI Keys Status:")
-    log(f"  OpenAI: {'[OK] Loaded' if r.keys['OPENAI_API_KEY'] else '[!] Missing - set in spider.env'}")
-    log(f"  Google CSE: {'[OK] Loaded' if r.keys['GOOGLE_API_KEY'] else '[!] Missing - set in spider.env'}")
-    log(f"  FEC: {'[OK] Using ' + r.keys['FEC_API_KEY'][:8] + '...' if r.keys['FEC_API_KEY'] else '[!] Missing'}")
-    
-    log("\nComponents Status:")
-    if r.connection_finder:
-        log(f"  [OK] Inner Circle: {len(r.connection_finder.df)} members loaded")
+def find_donor_in_data(data_rows: List[Dict[str, str]], name: str) -> Optional[Dict[str, str]]:
+    """Find donor by name, handling various column formats"""
+    n = name.strip().lower()
+    for r in data_rows:
+        # Try direct 'name' match
+        row_name = (r.get("name") or r.get("Name") or "").strip().lower()
+        if row_name == n:
+            return r
         
-        # Show deep research capability
-        has_google = bool(r.google.api_key)
-        has_openai = bool(r.ai_client)
-        research_model = r.keys.get('OPENAI_RESEARCH_MODEL', 'o1')
+        # Try combining First + Last
+        first = (r.get("First") or r.get("First Name") or "").strip()
+        last = (r.get("Last") or r.get("Last Name") or "").strip()
+        full_name = f"{first} {last}".strip().lower()
+        if full_name == n:
+            return r
+    return None
+
+def get_row_name(row: Dict[str, str]) -> str:
+    """Extract name from row, handling various formats"""
+    # Try direct name field
+    name = (row.get("name") or row.get("Name") or "").strip()
+    if name:
+        return name
+    
+    # Try combining First + Last
+    first = (row.get("First") or row.get("First Name") or "").strip()
+    last = (row.get("Last") or row.get("Last Name") or "").strip()
+    if first or last:
+        return f"{first} {last}".strip()
+    
+    return ""
+
+# -------------------------
+# SEARCH FUNCTIONS (Google Custom Search OR Tavily)
+# -------------------------
+@retry_with_backoff(max_retries=3)
+def tavily_search(query: str, num: int = 10) -> List[Dict[str, str]]:
+    """Tavily Search API - optimized for AI research"""
+    if not TAVILY_API_KEY:
+        log.warning("Tavily search disabled (missing API key)")
+        return []
+    
+    cache_key = cache.get_cache_key("tavily", {"q": query, "num": num})
+    
+    def fetcher():
+        url = "https://api.tavily.com/search"
+        headers = {"Content-Type": "application/json"}
+        data = {
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "max_results": min(10, num),
+            "search_depth": "basic",  # or "advanced" for deeper search
+            "include_answer": False,
+            "include_raw_content": False
+        }
+        r = requests.post(url, headers=headers, json=data, timeout=20)
+        r.raise_for_status()
+        results = (r.json() or {}).get("results", []) or []
+        return [
+            {
+                "title": item.get("title", ""),
+                "snippet": item.get("content", ""),
+                "link": item.get("url", "")
+            }
+            for item in results
+        ]
+    
+    return cache.get_or_fetch(cache_key, fetcher)
+
+def google_search(query: str, num: int = 10) -> List[Dict[str, str]]:
+    """Google CSE with smart key switching on rate limits
+    
+    Automatically switches to next available API key when rate limits are hit.
+    This provides seamless failover without manual intervention.
+    """
+    global _google_key_index, _google_key_exhausted
+    
+    if not GOOGLE_API_KEYS or not GOOGLE_CSE_ID:
+        log.warning("Google search disabled (missing API keys)")
+        return []
+    
+    cache_key = cache.get_cache_key("google", {"q": query, "num": num})
+    
+    def fetcher():
+        global _google_key_index, _google_key_exhausted
         
-        if has_google and has_openai:
-            log(f"  [OK] Deep Research: HYBRID MODE (Google + OpenAI {research_model})")
-            log(f"       → Google CSE gathers evidence")
-            log(f"       → OpenAI {research_model} analyzes connections")
-        elif has_openai:
-            log(f"  [PARTIAL] Deep Research: OpenAI {research_model} only (no Google CSE)")
-            log(f"            Add Google API keys for better results")
-        elif has_google:
-            log(f"  [PARTIAL] Deep Research: Google CSE only (no AI analysis)")
-            log(f"            Add OpenAI API key for intelligent extraction")
+        # Try each available key until one works
+        attempts = 0
+        max_attempts = len(GOOGLE_API_KEYS)
+        
+        while attempts < max_attempts:
+            # Get current key index (skip exhausted keys)
+            current_index = _google_key_index % len(GOOGLE_API_KEYS)
+            
+            # If all keys exhausted, reset and try again
+            if len(_google_key_exhausted) >= len(GOOGLE_API_KEYS):
+                log.warning("All Google API keys exhausted! Waiting and resetting...")
+                time.sleep(60)  # Wait 1 minute
+                _google_key_exhausted.clear()
+            
+            # Skip if this key is exhausted
+            if current_index in _google_key_exhausted:
+                _google_key_index += 1
+                attempts += 1
+                continue
+            
+            api_key = GOOGLE_API_KEYS[current_index]
+            
+            try:
+                url = "https://www.googleapis.com/customsearch/v1"
+                params = {
+                    "key": api_key,
+                    "cx": GOOGLE_CSE_ID,
+                    "q": query,
+                    "num": max(1, min(10, num)),
+                    "safe": "off"
+                }
+                r = requests.get(url, params=params, timeout=20)
+                r.raise_for_status()
+                
+                # Success! Return results
+                items = (r.json() or {}).get("items", []) or []
+                return [
+                    {
+                        "title": i.get("title", ""),
+                        "snippet": i.get("snippet", ""),
+                        "link": i.get("link", "")
+                    }
+                    for i in items
+                ]
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    # Rate limit hit! Mark this key as exhausted and try next
+                    _google_key_exhausted.add(current_index)
+                    log.warning(f"Google API key #{current_index + 1} hit rate limit (429). "
+                               f"Switching to next key... ({len(_google_key_exhausted)}/{len(GOOGLE_API_KEYS)} exhausted)")
+                    _google_key_index += 1
+                    attempts += 1
+                    time.sleep(1)  # Brief pause before trying next key
+                    continue
+                else:
+                    # Different error, re-raise
+                    raise
+            
+            except Exception as e:
+                # Unexpected error, try next key
+                log.warning(f"Error with Google API key #{current_index + 1}: {e}. Trying next key...")
+                _google_key_index += 1
+                attempts += 1
+                continue
+        
+        # All keys failed
+        log.error(f"All {len(GOOGLE_API_KEYS)} Google API keys failed or exhausted!")
+        return []
+    
+    return cache.get_or_fetch(cache_key, fetcher)
+
+def search_web(query: str, num: int = 10) -> List[Dict[str, str]]:
+    """Universal search function - uses configured provider"""
+    if SEARCH_PROVIDER == "tavily":
+        return tavily_search(query, num)
+    else:
+        return google_search(query, num)
+
+def google_pack_for_person(name: str) -> List[Dict[str, str]]:
+    """Optimized: Reduced from 11 to 5 queries to avoid rate limits"""
+    queries = [
+        f'"{name}" biography',
+        f'"{name}" linkedin',
+        f'"{name}" board',
+        f'"{name}" foundation',
+        f'"{name}" interview'
+    ]
+    results = []
+    for q in queries:
+        results.extend(search_web(q, num=5))
+        time.sleep(1.2)  # Rate limiting
+    
+    # Deduplicate by URL
+    uniq, seen = [], set()
+    for r in results:
+        u = r.get("link")
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(r)
+    return uniq[:30]  # Reduced from 60 to 30
+
+# -------------------------
+# OPENAI HELPERS (with caching)
+# -------------------------
+@retry_with_backoff(max_retries=3)
+def openai_chat_json(prompt: str, cache_key_prefix: str = "openai") -> Optional[Dict[str, Any]]:
+    """OpenAI with caching and retry logic - supports both old and new API"""
+    if not openai or not OPENAI_API_KEY:
+        log.warning("OpenAI disabled (missing API key)")
+        return None
+    
+    cache_key = cache.get_cache_key(cache_key_prefix, {"prompt": prompt[:100]})
+    
+    def fetcher():
+        if OPENAI_VERSION == "new":
+            # New API (1.0+)
+            resp = OPENAI_CLIENT.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0
+            )
+            text = resp.choices[0].message.content.strip()
         else:
-            log(f"  [!] Deep Research: Limited (no Google or OpenAI)")
-    else:
-        log(f"  [!] Inner Circle: Not found (looking for Inner_Circle.csv)")
+            # Old API (0.28)
+            resp = openai.ChatCompletion.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0
+            )
+            text = resp["choices"][0]["message"]["content"].strip()
+        
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+        return json.loads(text)
     
-    if r.ai_client:
-        log(f"  [OK] OpenAI Synthesis: Enabled ({r.keys['OPENAI_MODEL']})")
-    else:
-        log(f"  [!] OpenAI: Disabled - add OPENAI_API_KEY to spider.env")
+    return cache.get_or_fetch(cache_key, fetcher)
+
+# -------------------------
+# FEC (with caching)
+# -------------------------
+@retry_with_backoff(max_retries=3)
+def research_fec(name: str, max_pages: int = 3) -> Dict[str, Any]:
+    """FEC research with caching"""
+    cache_key = cache.get_cache_key("fec", {"name": name})
     
-    if r.google.api_key:
-        log(f"  [OK] Google CSE: Enabled")
-    else:
-        log(f"  [!] Google CSE: Disabled - add GOOGLE_API_KEY & GOOGLE_CSE_ID to spider.env")
-    
-    log(f"  [OK] Cache: {r.cache.cache_dir} (TTL: {r.cache.ttl}s)")
-
-    # Check for data.csv
-    default_csv = "data.csv"
-    args = sys.argv[1:]
-    batch = []
-    
-    if not args:
-        if os.path.exists(default_csv):
-            log(f"\n[OK] Found {default_csv}")
-            batch = load_people_from_csv(default_csv)
-            log(f"[OK] Loaded {len(batch)} prospects")
-        else:
-            log(f"\n[!] No {default_csv} found")
-            log("\nUsage:")
-            log(f"  1. Create '{default_csv}' with columns: First, Last, City, State")
-            log(f"  2. Run: python3 test_spider.py")
-            sys.exit(1)
-    elif len(args) == 1 and args[0].lower().endswith(".csv"):
-        batch = load_people_from_csv(args[0])
-    else:
-        first = args[0]
-        last = args[1] if len(args)>1 else ""
-        city = args[2] if len(args)>2 else ""
-        state = args[3] if len(args)>3 else ""
-        batch = [{"first":first,"last":last,"city":city,"state":state}]
-
-    if not batch:
-        log("\n[!] No prospects to process")
-        sys.exit(1)
-
-    os.makedirs("outputs", exist_ok=True)
-
-    # Process each person
-    for i, person in enumerate(batch):
-        log(f"\n{'='*70}")
-        log(f"PROSPECT {i+1}/{len(batch)}: {person['first']} {person.get('last','')}")
-        log(f"{'='*70}")
+    def fetcher():
+        summary = {
+            "found": False,
+            "total": 0.0,
+            "count": 0,
+            "by_party": {"R": 0.0, "D": 0.0, "Other": 0.0},
+            "recent_years": {},
+            "top_recipients": []
+        }
+        
+        if not FEC_API_KEY:
+            log.warning("FEC disabled (missing API key)")
+            return summary
+        
+        base = "https://api.open.fec.gov/v1/schedules/schedule_a/"
+        params = {
+            "api_key": FEC_API_KEY,
+            "contributor_name": name,
+            "per_page": 100,
+            "sort": "contribution_receipt_date"
+        }
+        
+        page = 1
+        recipients = defaultdict(float)
         
         try:
-            prof = r.research(person)
-            docx_path = render_enhanced_partner_profile(prof, out_dir="outputs")
+            while page <= max_pages:
+                params["page"] = page
+                r = requests.get(base, params=params, timeout=25)
+                r.raise_for_status()
+                data = r.json()
+                results = data.get("results", []) or []
+                if not results:
+                    break
+                
+                for it in results:
+                    amt = float(it.get("contribution_receipt_amount") or 0.0)
+                    summary["total"] += amt
+                    summary["count"] += 1
+                    summary["found"] = True
+                    
+                    # Year bucket
+                    try:
+                        yr = int((it.get("contribution_receipt_date") or "")[:4])
+                        summary["recent_years"][yr] = summary["recent_years"].get(yr, 0.0) + amt
+                    except:
+                        pass
+                    
+                    # Recipient & party
+                    rcpt = it.get("recipient_name") or it.get("committee_name") or ""
+                    if rcpt:
+                        recipients[rcpt] += amt
+                    p = (it.get("party_full") or "").upper()
+                    if p.startswith("DEM"):
+                        summary["by_party"]["D"] += amt
+                    elif p.startswith("REP"):
+                        summary["by_party"]["R"] += amt
+                    else:
+                        summary["by_party"]["Other"] += amt
+                
+                page += 1
+                if not data.get("pagination", {}).get("pages"):
+                    break
+                if page > data["pagination"]["pages"]:
+                    break
+        except Exception as e:
+            log.warning(f"FEC error: {e}")
+        
+        # Pattern
+        R, D, O = summary["by_party"]["R"], summary["by_party"]["D"], summary["by_party"]["Other"]
+        tot = summary["total"] or 1.0
+        rp = R / tot * 100
+        dp = D / tot * 100
+        if max(rp, dp) <= 65:
+            pattern = "Bipartisan donor"
+        elif rp >= 70:
+            pattern = "Republican donor"
+        elif dp >= 70:
+            pattern = "Democratic donor"
+        else:
+            pattern = "Mixed donor"
+        summary["pattern"] = pattern
+        
+        # Top recipients
+        top = sorted(recipients.items(), key=lambda kv: -kv[1])[:10]
+        summary["top_recipients"] = [{"name": k, "total": v} for k, v in top]
+        summary["profile_url"] = f"https://www.fec.gov/data/receipts/individual-contributions/?contributor_name={requests.utils.quote(name)}"
+        
+        return summary
+    
+    return cache.get_or_fetch(cache_key, fetcher)
+
+# -------------------------
+# INNER CIRCLE CONNECTIONS (optimized)
+# -------------------------
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+CONN_SCHEMA_EXAMPLE = {
+    "found": True,
+    "type": "co-board | co-event | alumni | other",
+    "strength": 72,
+    "description": "One-liner summary",
+    "timeframe": "2011-2014",
+    "evidence": "Short quote",
+    "source": "https://example.com",
+    "confidence": 0.85
+}
+
+CONN_PROMPT_TMPL = """Verify connection between TWO people.
+Return STRICT JSON in this schema:
+{schema}
+
+Rules:
+- STRONG (70-100): Direct tie (co-board, co-authors, co-panelists at named event)
+- MEDIUM (50-69): Likely tie (same program/org with overlap, multiple indirect interactions)
+- POTENTIAL (30-49): Weak tie (same school non-overlap, same org different eras)
+- REJECT (<30): No real connection
+
+Prospect: "{prospect}"
+Inner circle: "{member}"
+
+SEARCH RESULTS:
+{context}
+
+Return JSON only:"""
+
+def google_queries_for_pair(donor: str, member: str, donor_city: str = "", donor_state: str = "", reduced: bool = False) -> List[str]:
+    """Generate search queries for donor-member pair
+    
+    Args:
+        reduced: If True, returns 1 query instead of 3 (for rate limit compliance)
+    """
+    donor_parts = donor.split()
+    member_parts = member.split()
+    donor_last = donor_parts[-1] if donor_parts else donor
+    member_last = member_parts[-1] if member_parts else member
+    
+    if reduced:
+        # REDUCED MODE: Just 1 high-quality query
+        return [f'"{donor}" "{member}"']
+    else:
+        # STANDARD MODE: 3 queries for thorough search
+        queries = [
+            f'"{donor}" "{member}"',
+            f'"{donor_last}" "{member_last}" {donor_state}' if donor_state else f'"{donor_last}" "{member_last}"',
+            f'"{donor}" "{member}" board'
+        ]
+        return queries
+
+def classify_connection(donor_name: str, donor_city: str, donor_state: str,
+                       member_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Classify connection with confidence scoring"""
+    # Build member name
+    first = (member_row.get("First") or "").strip()
+    middle = (member_row.get("Middle") or "").strip()
+    last = (member_row.get("Last") or "").strip()
+    member_name = " ".join([p for p in [first, middle, last] if p])
+    
+    if not member_name:
+        return None
+    
+    # Build queries (reduced to 3)
+    queries = google_queries_for_pair(donor_name, member_name, donor_city, donor_state)
+    results = []
+    
+    for q in queries:
+        results.extend(search_web(q, num=3))  # Reduced from 5 to 3
+        time.sleep(1.2)  # Rate limit: ~50 queries per 100 seconds (safe margin)
+    
+    # Deduplicate
+    uniq, seen = [], set()
+    for r in results:
+        u = r.get("link")
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(r)
+    
+    context_lines = [f"- {r.get('title', '')} | {r.get('snippet', '')} | {r.get('link', '')}" 
+                     for r in uniq[:8]]  # Reduced from 12 to 8
+    context = "\n".join(context_lines) if context_lines else "NO WEB HITS"
+    
+    if context == "NO WEB HITS":
+        return None
+    
+    prompt = CONN_PROMPT_TMPL.format(
+        schema=json.dumps(CONN_SCHEMA_EXAMPLE, indent=2),
+        prospect=donor_name,
+        member=member_name,
+        context=context
+    )
+    
+    parsed = openai_chat_json(prompt, cache_key_prefix=f"conn_{donor_name}_{member_name}")
+    if not parsed or not parsed.get("found"):
+        return None
+    
+    strength = int(parsed.get("strength") or 0)
+    if strength < 30:
+        return None
+    
+    out = {
+        "inner_circle_name": member_name,
+        "type": parsed.get("type") or "other",
+        "strength": strength,
+        "description": parsed.get("description") or "",
+        "timeframe": parsed.get("timeframe") or "",
+        "evidence": parsed.get("evidence") or "",
+        "source": parsed.get("source") or "",
+        "confidence": parsed.get("confidence", 0.5),
+        "citations": [parsed.get("source")] if parsed.get("source") else []
+    }
+    
+    if out["strength"] >= 70:
+        out["strength_bucket"] = "Strong"
+    elif out["strength"] >= 50:
+        out["strength_bucket"] = "Medium"
+    else:
+        out["strength_bucket"] = "Potential"
+    
+    return out
+
+def research_inner_circle(prospect: Dict[str, Any], 
+                         inner_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Research inner circle connections"""
+    donor = prospect.get("name") or ""
+    donor_city = prospect.get("City") or ""
+    donor_state = prospect.get("State") or ""
+    
+    connections, used = [], []
+    total = len(inner_rows)
+    log.info(f"Analyzing {total} inner-circle members for {donor}...")
+    
+    for i, row in enumerate(inner_rows, start=1):
+        if (i % 25) == 0:
+            log.info(f"  Progress {i}/{total}...")
+        
+        try:
+            c = classify_connection(donor, donor_city, donor_state, row)
+            if c:
+                connections.append(c)
+                used.extend(c.get("citations", []))
+        except Exception as e:
+            log.warning(f"Member #{i} failed: {e}")
+        
+        time.sleep(0.5)  # Small delay between members (on top of query delays)
+    
+    connections.sort(key=lambda x: (-x["strength"], x["inner_circle_name"]))
+    used = list(set(used))  # Dedupe
+    
+    log.info(f"Connections found: "
+             f"{sum(1 for c in connections if c['strength_bucket']=='Strong')} strong, "
+             f"{sum(1 for c in connections if c['strength_bucket']=='Medium')} medium, "
+             f"{sum(1 for c in connections if c['strength_bucket']=='Potential')} potential.")
+    
+    return connections, used
+
+# -------------------------
+# PROFILE EXTRACTION
+# -------------------------
+PROFILE_SCHEMA = {
+    "name": "",
+    "contact": {"address": "", "phone": "", "email": "", "salesforce_url": ""},
+    "dob": "",
+    "family": "",
+    "education": [],
+    "current_position": "",
+    "previous_positions": [],
+    "nonprofit_boards": [],
+    "other_affiliations": [],
+    "publications": [],
+    "biography": "",
+    "background_education": "",
+    "professional_roles": [],
+    "board_positions": [],
+    "key_relationships": [],
+    "interview_history": [],
+    "personal_philanthropy": "",
+    "organizations": [],
+    "boards": [],
+    "universities": [],
+    "foundation_assets": None
+}
+
+PROFILE_PROMPT_TMPL = """Build structured profile JSON from web snippets.
+Return STRICT JSON in this schema:
+{schema}
+
+Guidance:
+- Be concise and factual
+- Attach URLs where possible
+- Do NOT invent facts
+
+NAME: {name}
+
+SNIPPETS:
+{snippets}
+
+Return JSON only:"""
+
+DEEP_BIO_PROMPT = """You are writing a comprehensive biographical narrative for a donor profile document, similar to profiles written for major philanthropic prospects.
+
+Your task: Write a detailed, narrative-style biographical section about this person based on the web search results provided. This should read like a well-researched profile article, NOT a bulleted list.
+
+PERSON: {name}
+
+INSTRUCTIONS:
+1. Write 3-5 detailed paragraphs in flowing narrative prose
+2. Include full name, any nicknames, and relevant name variations
+3. Cover family background if available (e.g., "fifth-generation member of the [Family] business legacy")
+4. Describe early life, upbringing, and formative experiences
+5. Detail educational background - schools, degrees, areas of study
+6. Explain career trajectory and major professional milestones
+7. Mention significant companies, organizations, or institutions they've been associated with
+8. Include founding dates, company descriptions, and historical context where relevant
+9. Write in third person using past and present tense appropriately
+10. Be specific with names, dates, places, and organizations
+11. If information is limited, write what IS known without making up details
+
+STYLE: Emulate the tone of The New York Times profile or Forbes biographical piece - authoritative, detailed, and narrative-driven.
+
+WEB SEARCH RESULTS:
+{snippets}
+
+Write the biographical narrative (3-5 paragraphs, narrative prose only):"""
+
+def extract_deep_biography(name: str) -> Tuple[str, List[str]]:
+    """Extract comprehensive biographical narrative using enhanced research
+    Returns: (biography_text, list_of_source_urls)
+    """
+    log.info(f"  → Conducting deep biographical research for {name}...")
+    
+    # Expanded biographical queries
+    bio_queries = [
+        f'"{name}" biography background',
+        f'"{name}" early life family',
+        f'"{name}" education university college',
+        f'"{name}" career history',
+        f'"{name}" founded company business',
+        f'"{name}" profile about'
+    ]
+    
+    results = []
+    for q in bio_queries:
+        results.extend(search_web(q, num=5))
+        time.sleep(1.2)  # Rate limit
+    
+    # Deduplicate
+    uniq, seen = [], set()
+    source_urls = []
+    for r in results:
+        u = r.get("link")
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(r)
+            source_urls.append(u)
+    
+    # Build context for AI
+    lines = [f"• {r.get('title', '')}\n  {r.get('snippet', '')}\n  URL: {r.get('link', '')}" 
+             for r in uniq[:40]]  # Use up to 40 results for deep research
+    
+    cache_key = cache.get_cache_key("deep_bio", {"name": name})
+    
+    def fetcher():
+        prompt = DEEP_BIO_PROMPT.format(
+            name=name,
+            snippets="\n\n".join(lines) or "No biographical information found."
+        )
+        
+        if OPENAI_VERSION == "new":
+            resp = OPENAI_CLIENT.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,  # Slightly higher for narrative quality
+                max_tokens=2000  # Allow longer biographical narratives
+            )
+            return resp.choices[0].message.content.strip()
+        else:
+            resp = openai.ChatCompletion.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2000
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+    
+    try:
+        biography = cache.get_or_fetch(cache_key, fetcher)
+        return biography, source_urls[:40]  # Return narrative and up to 40 source URLs
+    except Exception as e:
+        log.warning(f"Deep biography extraction failed: {e}")
+        return f"Biographical information for {name} is being researched.", []
+
+def extract_profile(name: str) -> Dict[str, Any]:
+    """Extract profile with enhanced biographical research"""
+    log.info("  → Conducting standard profile extraction...")
+    
+    search_results = google_pack_for_person(name)
+    lines = [f"- {r.get('title', '')} | {r.get('snippet', '')} | {r.get('link', '')}" 
+             for r in search_results]
+    
+    prompt = PROFILE_PROMPT_TMPL.format(
+        schema=json.dumps(PROFILE_SCHEMA, indent=2),
+        name=name,
+        snippets="\n".join(lines[:30]) or "NONE"
+    )
+    
+    parsed = openai_chat_json(prompt, cache_key_prefix=f"profile_{name}") or {}
+    parsed["name"] = parsed.get("name") or name
+    parsed["organizations"] = parsed.get("organizations") or []
+    parsed["boards"] = parsed.get("boards") or []
+    
+    # Derive universities from education
+    if not parsed.get("universities"):
+        unis = []
+        for e in parsed.get("education", []):
+            m = re.findall(
+                r"(Harvard|Yale|Princeton|Stanford|Chicago|Columbia|NYU|Oxford|Cambridge|"
+                r"MIT|Duke|Penn|UPenn|Wharton|Georgetown|Brown|Dartmouth|Cornell)",
+                e, re.I
+            )
+            if m:
+                unis.extend(m)
+        parsed["universities"] = sorted(set(unis))
+    
+    # DEEP BIOGRAPHICAL RESEARCH - Generate narrative biography
+    log.info("  → Starting deep biographical narrative generation...")
+    deep_bio, bio_sources = extract_deep_biography(name)
+    parsed["biography"] = deep_bio  # Replace with narrative version
+    parsed["bio_sources"] = bio_sources  # Store source URLs
+    
+    return parsed
+
+# -------------------------
+# IHS DONOR PROBABILITY MODEL
+# -------------------------
+def pct(a, b):
+    try:
+        return (float(a) / float(b)) * 100.0 if b else 0.0
+    except:
+        return 0.0
+
+def fmt_money(x):
+    try:
+        return "${:,.0f}".format(float(x))
+    except:
+        return "$0"
+
+def top_connector(conns):
+    if not conns:
+        return None
+    ordered = sorted(
+        conns,
+        key=lambda c: (
+            0 if c['strength_bucket'] == "Strong" else 1 if c['strength_bucket'] == "Medium" else 2,
+            -(c['strength'] or 0)
+        )
+    )
+    return ordered[0]
+
+def ihs_matrix_section(prospect: Dict[str, Any], fec: Dict[str, Any],
+                      connections: List[Dict[str, Any]], inner_total: int) -> Tuple[str, List[str]]:
+    """Generate IHS donor probability assessment"""
+    citations = []
+    R = fec.get("by_party", {}).get("R", 0.0)
+    D = fec.get("by_party", {}).get("D", 0.0)
+    O = fec.get("by_party", {}).get("Other", 0.0)
+    tot = fec.get("total", 0.0)
+    pattern = fec.get("pattern", "")
+    
+    # Alignment
+    if tot > 0:
+        rp, dp = pct(R, tot), pct(D, tot)
+        if rp >= 70:
+            align = "Moderate to High (Right-leaning)"
+        elif dp >= 70:
+            align = "Low to Moderate (Left-leaning)"
+        elif max(rp, dp) <= 65:
+            align = "Moderate (Bipartisan)"
+        else:
+            align = "Moderate"
+        align_reasons = [
+            f"Federal giving split — R {fmt_money(R)} ({rp:.0f}%), "
+            f"D {fmt_money(D)} ({dp:.0f}%), Other {fmt_money(O)}."
+        ]
+        if pattern:
+            align_reasons.append(f"Pattern: {pattern}.")
+    else:
+        align = "Moderate"
+        align_reasons = ["No federal giving on file; alignment inferred from biography/affiliations."]
+    
+    if fec.get("profile_url"):
+        citations.append(fec["profile_url"])
+    
+    # Engagement/Network
+    strong = sum(1 for c in connections if c["strength_bucket"] == "Strong")
+    medium = sum(1 for c in connections if c["strength_bucket"] == "Medium")
+    potential = sum(1 for c in connections if c["strength_bucket"] == "Potential")
+    engagement_index = strong + 0.6 * medium
+    eng = "High" if engagement_index >= 3 else "Moderate" if engagement_index >= 1 else "Low"
+    net = "High" if (strong + medium) >= 5 else "Moderate" if (strong + medium) >= 2 else "Low"
+    
+    eng_reasons = [
+        f"Inner-circle ties found: {strong} strong, {medium} medium, {potential} potential "
+        f"(out of ~{inner_total} analyzed)."
+    ]
+    net_reasons = [f"Breadth of network into IHS: {strong + medium} strong/medium ties documented."]
+    
+    # Interest
+    pf = (prospect or {}).get("professional_field", "") or (prospect or {}).get("current_position", "")
+    orgs = set(prospect.get("organizations") or []) | set(prospect.get("boards") or [])
+    interest_keywords = ["economics", "policy", "law", "education", "finance", "business"]
+    interest_orgs = ["cato", "mercatus", "heritage", "atlas", "aei", "hoover"]
+    interest = "High" if any(k in (pf or "").lower() for k in interest_keywords) or \
+                          any(any(x in o.lower() for x in interest_orgs) for o in orgs) else "Moderate"
+    int_reasons = []
+    if pf:
+        int_reasons.append(f"Career domain: {pf}.")
+    hits = [o for o in orgs if any(x in o.lower() for x in interest_orgs)]
+    if hits:
+        int_reasons.append("Affiliations include: " + ", ".join(sorted(set(hits))) + ".")
+    
+    # Capacity
+    cap = "High" if tot >= 100000 else "Moderate to High" if tot >= 25000 else \
+          "Moderate" if tot >= 10000 else "Low to Moderate"
+    cap_reasons = [
+        f"Federal giving recorded: {fmt_money(tot)} across {fec.get('count', 0)} contributions."
+    ] if tot > 0 else ["Limited public political giving; philanthropic capacity inferred from roles/boards."]
+    
+    # Synthesis
+    score = 0
+    score += {"Low": 0, "Moderate": 1, "Moderate (Bipartisan)": 1, 
+              "Moderate to High (Right-leaning)": 2, "Low to Moderate (Left-leaning)": 0.5, "High": 2}.get(align, 1)
+    score += {"Low": 0, "Moderate": 1, "High": 2}.get(eng, 1)
+    score += {"Low": 0, "Moderate": 1, "High": 2}.get(interest, 1)
+    score += {"Low": 0, "Moderate": 1, "High": 2}.get(net, 1)
+    score += {"Low": 0, "Low to Moderate": 0.5, "Moderate": 1, "Moderate to High": 1.5, "High": 2}.get(cap, 1)
+    
+    sol = "High" if score >= 7 else "Moderate to High" if score >= 5 else \
+          "Moderate" if score >= 3.5 else "Low to Moderate"
+    
+    # Ask range
+    if cap == "High":
+        a0, a1 = 50000, 250000
+    elif cap == "Moderate to High":
+        a0, a1 = 10000, 50000
+    elif cap == "Moderate":
+        a0, a1 = 5000, 15000
+    else:
+        a0, a1 = 2500, 10000
+    
+    if eng == "High":
+        a0, a1 = int(a0 * 1.25), int(a1 * 1.25)
+    elif eng == "Low":
+        a0, a1 = int(a0 * 0.8), int(a1 * 0.8)
+    
+    ask = f"{fmt_money(a0)}–{fmt_money(a1)} (initial)"
+    
+    # Warm intro
+    connector = top_connector(connections)
+    warm_intro = f"Warm introduction via {connector['inner_circle_name']} " \
+                 f"({connector.get('type', 'connection')}, score {connector.get('strength')})." \
+                 if connector else "Warm introduction: identify a credible referrer in shared domain."
+    
+    # Build text
+    lines = []
+    lines.append("IHS Donor Probability Model Assessment")
+    lines.append("")
+    lines.append(f"**Alignment ({align})**")
+    for x in align_reasons:
+        lines.append(f"• {x}")
+    lines.append("")
+    lines.append(f"**Engagement ({eng})**")
+    for x in eng_reasons:
+        lines.append(f"• {x}")
+    lines.append("")
+    lines.append(f"**Interest ({interest})**")
+    for x in int_reasons or ["• Limited domain signals; provisional inference."]:
+        lines.append(x if x.startswith("•") else f"• {x}")
+    lines.append("")
+    lines.append(f"**Network ({net})**")
+    for x in net_reasons:
+        lines.append(f"• {x}")
+    lines.append("")
+    lines.append(f"**Capacity ({cap})**")
+    for x in cap_reasons:
+        lines.append(f"• {x}")
+    lines.append("")
+    lines.append(f"**Solicitation Potential ({sol})**")
+    lines.append(f"Recommended initial ask range: {ask}")
+    lines.append("")
+    lines.append("**Approach Strategy (next 60–90 days)**")
+    lines.append(f"1) {warm_intro}")
+    lines.append("2) Message angle: emphasize measurable impact and policy relevance.")
+    lines.append("3) Discovery call: confirm program focus, cadence, and timing.")
+    lines.append("4) Engagement: invite to small-group salon/briefing; follow with tailored memo.")
+    lines.append(f"5) The ask: position a {ask} commitment tied to a concrete initiative.")
+    
+    return "\n".join(lines), citations
+
+# -------------------------
+# DOCX RENDERERS - NARRATIVE FORMAT (STEVE EVERIST STYLE)
+# -------------------------
+def render_title(doc: Document, name: str):
+    """Render document title matching Steve Everist format"""
+    title = doc.add_heading(f"{name}: Donor Profile", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+def render_narrative_section(doc: Document, title: str, paragraphs: List[str]):
+    """Render a narrative section with multiple paragraphs"""
+    doc.add_heading(title, level=2)
+    for para in paragraphs:
+        if para.strip():
+            doc.add_paragraph(para.strip())
+
+def generate_biographical_section(R: Dict[str, Any]) -> List[str]:
+    """Generate narrative biographical section"""
+    paragraphs = []
+    
+    bio = R.get("biography", "")
+    if bio:
+        # Split biography into paragraphs if it's a single string
+        if isinstance(bio, str):
+            paragraphs = [p.strip() for p in bio.split("\n\n") if p.strip()]
+        else:
+            paragraphs = bio
+    
+    # Add education details if available
+    education = R.get("education", [])
+    family = R.get("family", "")
+    
+    if education and not any("education" in p.lower() for p in paragraphs):
+        edu_text = " ".join(education) if isinstance(education, list) else education
+        paragraphs.append(edu_text)
+    
+    if not paragraphs:
+        paragraphs = ["Biographical information is being researched."]
+    
+    return paragraphs
+
+DEEP_CAREER_PROMPT = """You are writing a comprehensive "Career History & Business Leadership" section for a donor profile document.
+
+Your task: Write a detailed, narrative-style career history based on the web search results provided. This should read like a professional biography section in Forbes or Fortune magazine.
+
+PERSON: {name}
+
+INSTRUCTIONS:
+1. Write 4-6 detailed paragraphs in flowing narrative prose
+2. Start with current position and work backwards chronologically
+3. Include specific job titles, company names, and years
+4. Describe major career milestones, achievements, and transitions
+5. Explain leadership roles and business transformations
+6. Detail board positions with major companies or organizations
+7. Include founding dates of companies, mergers, acquisitions, strategic decisions
+8. Describe the companies/organizations (what they do, their significance)
+9. Mention industry influence, awards, recognitions
+10. Use transition phrases to connect different career phases
+11. Write in third person, past and present tense appropriately
+
+STYLE: Authoritative, detailed, and respectful. Similar to executive biographies in annual reports or leadership profiles in business publications.
+
+WEB SEARCH RESULTS:
+{snippets}
+
+Write the career history narrative (4-6 paragraphs, narrative prose only):"""
+
+def extract_deep_career(name: str) -> Tuple[str, List[str]]:
+    """Extract comprehensive career narrative using enhanced research
+    Returns: (career_text, list_of_source_urls)
+    """
+    log.info(f"  → Conducting deep career research for {name}...")
+    
+    # Career-focused queries
+    career_queries = [
+        f'"{name}" career history',
+        f'"{name}" CEO president chairman',
+        f'"{name}" board director',
+        f'"{name}" company founded',
+        f'"{name}" executive leadership',
+        f'"{name}" business achievements'
+    ]
+    
+    results = []
+    for q in career_queries:
+        results.extend(search_web(q, num=5))
+        time.sleep(1.2)  # Rate limit
+    
+    # Deduplicate
+    uniq, seen = [], set()
+    source_urls = []
+    for r in results:
+        u = r.get("link")
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(r)
+            source_urls.append(u)
+    
+    # Build context
+    lines = [f"• {r.get('title', '')}\n  {r.get('snippet', '')}\n  URL: {r.get('link', '')}" 
+             for r in uniq[:40]]
+    
+    cache_key = cache.get_cache_key("deep_career", {"name": name})
+    
+    def fetcher():
+        prompt = DEEP_CAREER_PROMPT.format(
+            name=name,
+            snippets="\n\n".join(lines) or "No career information found."
+        )
+        
+        if OPENAI_VERSION == "new":
+            resp = OPENAI_CLIENT.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2000
+            )
+            return resp.choices[0].message.content.strip()
+        else:
+            resp = openai.ChatCompletion.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2000
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+    
+    try:
+        career = cache.get_or_fetch(cache_key, fetcher)
+        return career, source_urls[:40]  # Return narrative and up to 40 source URLs
+    except Exception as e:
+        log.warning(f"Deep career extraction failed: {e}")
+        return f"Career history for {name} is being researched.", []
+
+def generate_career_section(R: Dict[str, Any]) -> List[str]:
+    """Generate Career History & Business Leadership section with deep research"""
+    # Check if we already did deep research (stored in R)
+    if R.get("deep_career_narrative"):
+        # Split into paragraphs
+        narrative = R["deep_career_narrative"]
+        paragraphs = [p.strip() for p in narrative.split("\n\n") if p.strip()]
+        if paragraphs:
+            return paragraphs
+    
+    # Fallback to basic extraction
+    paragraphs = []
+    current_pos = R.get("current_position", "")
+    previous_pos = R.get("previous_positions", [])
+    boards = R.get("nonprofit_boards", [])
+    
+    if current_pos:
+        paragraphs.append(f"Currently, {R.get('name', 'the donor')} serves as {current_pos}.")
+    
+    if previous_pos:
+        career_text = "Previous roles include: " + "; ".join(previous_pos) + "."
+        paragraphs.append(career_text)
+    
+    if boards:
+        board_names = [b.get('org', '') for b in boards if b.get('org')]
+        if board_names:
+            paragraphs.append(f"Board service includes: {', '.join(board_names)}.")
+    
+    if not paragraphs:
+        paragraphs = ["Career history is being researched."]
+    
+    return paragraphs
+
+DEEP_PHILANTHROPY_PROMPT = """You are writing a comprehensive "Philanthropic Activities & Causes Supported" section for a donor profile document.
+
+Your task: Write a detailed, narrative-style philanthropy section based on the web search results provided. This should read like a professional philanthropic profile.
+
+PERSON: {name}
+
+INSTRUCTIONS:
+1. Write 3-5 detailed paragraphs in flowing narrative prose
+2. Describe charitable giving patterns and focus areas
+3. Detail foundation involvement (if applicable) with founding dates and mission
+4. Explain board memberships with nonprofit organizations - name the organizations and describe their work
+5. Highlight specific gifts with amounts if available
+6. Describe philanthropic philosophy or themes (education, health, arts, faith-based, etc.)
+7. Mention collaborative philanthropy or partnerships with other donors
+8. Include family involvement in giving if relevant
+9. Use specific organization names, dollar amounts, and dates
+10. Write in third person
+
+STYLE: Respectful and detailed, similar to foundation annual reports or philanthropic profiles.
+
+WEB SEARCH RESULTS:
+{snippets}
+
+Write the philanthropic activities narrative (3-5 paragraphs, narrative prose only):"""
+
+def extract_deep_philanthropy(name: str) -> Tuple[str, List[str]]:
+    """Extract comprehensive philanthropic narrative
+    Returns: (philanthropy_text, list_of_source_urls)
+    """
+    log.info(f"  → Conducting deep philanthropic research for {name}...")
+    
+    philanthropy_queries = [
+        f'"{name}" foundation charity donation',
+        f'"{name}" philanthropic giving nonprofit',
+        f'"{name}" board trustee',
+        f'"{name}" charitable contribution',
+        f'"{name}" donor supporter'
+    ]
+    
+    results = []
+    for q in philanthropy_queries:
+        results.extend(search_web(q, num=5))
+        time.sleep(1.2)  # Rate limit
+    
+    # Deduplicate
+    uniq, seen = [], set()
+    source_urls = []
+    for r in results:
+        u = r.get("link")
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(r)
+            source_urls.append(u)
+    
+    lines = [f"• {r.get('title', '')}\n  {r.get('snippet', '')}\n  URL: {r.get('link', '')}" 
+             for r in uniq[:40]]
+    
+    cache_key = cache.get_cache_key("deep_philanthropy", {"name": name})
+    
+    def fetcher():
+        prompt = DEEP_PHILANTHROPY_PROMPT.format(
+            name=name,
+            snippets="\n\n".join(lines) or "No philanthropic information found."
+        )
+        
+        if OPENAI_VERSION == "new":
+            resp = OPENAI_CLIENT.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2000
+            )
+            return resp.choices[0].message.content.strip()
+        else:
+            resp = openai.ChatCompletion.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2000
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+    
+    try:
+        philanthropy = cache.get_or_fetch(cache_key, fetcher)
+        return philanthropy, source_urls[:40]  # Return narrative and up to 40 source URLs
+    except Exception as e:
+        log.warning(f"Deep philanthropy extraction failed: {e}")
+        return f"Philanthropic activities for {name} are being researched.", []
+
+def generate_philanthropic_section(R: Dict[str, Any]) -> List[str]:
+    """Generate Philanthropic Activities & Causes Supported section with deep research"""
+    # Check if we have deep research
+    if R.get("deep_philanthropy_narrative"):
+        narrative = R["deep_philanthropy_narrative"]
+        paragraphs = [p.strip() for p in narrative.split("\n\n") if p.strip()]
+        if paragraphs:
+            return paragraphs
+    
+    # Fallback to basic extraction
+    paragraphs = []
+    boards = R.get("nonprofit_boards", [])
+    affiliations = R.get("other_affiliations", [])
+    
+    if boards:
+        para = f"{R.get('name', 'The donor')} demonstrates philanthropic engagement through board service with "
+        board_list = [f"{b.get('org', '')} ({b.get('role', 'Member')})" for b in boards]
+        para += ", ".join(board_list) + "."
+        paragraphs.append(para)
+    
+    if affiliations:
+        paragraphs.append("Additional philanthropic affiliations include: " + "; ".join(affiliations) + ".")
+    
+    if not paragraphs:
+        paragraphs = ["Philanthropic activities are being researched."]
+    
+    return paragraphs
+
+def generate_political_section(R: Dict[str, Any], fec: Dict[str, Any]) -> List[str]:
+    """Generate Political Donations & Ideological Leanings section"""
+    paragraphs = []
+    
+    if fec and fec.get("found"):
+        total = fec.get("total", 0.0)
+        byp = fec.get("by_party", {})
+        pattern = fec.get("pattern", "")
+        
+        # Opening paragraph with total giving
+        para = f"{R.get('name', 'The donor')} is an active political donor with federal contributions totaling {fmt_money(total)}. "
+        
+        # Party breakdown
+        rep_amt = byp.get('R', 0.0)
+        dem_amt = byp.get('D', 0.0)
+        other_amt = byp.get('Other', 0.0)
+        
+        if rep_amt > dem_amt * 2:
+            para += f"The giving pattern strongly favors Republican candidates and causes ({fmt_money(rep_amt)} to Republicans vs. {fmt_money(dem_amt)} to Democrats), "
+            para += "indicating a conservative political orientation aligned with free-market principles."
+        elif dem_amt > rep_amt * 2:
+            para += f"The giving pattern favors Democratic candidates and causes ({fmt_money(dem_amt)} to Democrats vs. {fmt_money(rep_amt)} to Republicans)."
+        else:
+            para += f"The giving shows a relatively balanced approach across parties (R: {fmt_money(rep_amt)}, D: {fmt_money(dem_amt)})."
+        
+        paragraphs.append(para)
+        
+        # Pattern analysis
+        if pattern:
+            paragraphs.append(f"Contribution pattern: {pattern}.")
+    else:
+        paragraphs.append(f"No federal political contributions found on file for {R.get('name', 'this donor')}. "
+                         "This may indicate either private political engagement through other channels, "
+                         "or a preference for focusing philanthropic resources on non-political causes.")
+    
+    return paragraphs
+
+def generate_connections_section(R: Dict[str, Any], connections: List[Dict[str, Any]], inner_total: int) -> List[str]:
+    """Generate Connections section - Inner Circle comparison results"""
+    paragraphs = []
+    
+    name = R.get('name', 'The donor')
+    
+    # Opening paragraph
+    para = f"As part of this research, {name} was systematically compared against {inner_total} members of IHS's Inner Circle—a network comprising board members, officers, scholars, and key supporters of liberty-oriented causes. "
+    para += "The analysis searched for documented connections including co-authorship, shared board service, institutional overlap, conference participation, and other verifiable relationships."
+    paragraphs.append(para)
+    
+    if not connections:
+        paragraphs.append(f"The systematic comparison of {name} against the {inner_total} Inner Circle members did not identify strong documented connections at this time. "
+                         "This does not preclude informal relationships or shared interests that may not be publicly documented. "
+                         "Further relationship mapping through personal introductions may reveal additional network pathways.")
+        return paragraphs
+    
+    # Categorize connections
+    strong = [c for c in connections if c.get("strength_bucket") == "Strong"]
+    medium = [c for c in connections if c.get("strength_bucket") == "Medium"]
+    potential = [c for c in connections if c.get("strength_bucket") == "Potential"]
+    
+    # Strong connections paragraph
+    if strong:
+        para = f"**Strong Connections ({len(strong)} identified):** "
+        para += f"{name} has documented, verifiable ties to the following Inner Circle members: "
+        
+        conn_details = []
+        for c in strong[:5]:  # Show top 5 strong connections
+            detail = f"{c.get('inner_circle_name', '')}"
+            if c.get('description'):
+                detail += f" ({c.get('description', '')})"
+            conn_details.append(detail)
+        
+        para += "; ".join(conn_details)
+        if len(strong) > 5:
+            para += f"; and {len(strong) - 5} additional strong connections"
+        para += ". These relationships represent direct collaborative ties through shared institutions, co-authored work, or joint board service that could facilitate warm introductions and credibility with IHS leadership."
+        paragraphs.append(para)
+    
+    # Medium connections paragraph
+    if medium:
+        para = f"**Medium-Strength Connections ({len(medium)} identified):** "
+        para += "Additional likely connections through institutional overlap or shared networks include: "
+        
+        names = [c.get('inner_circle_name', '') for c in medium[:5]]
+        para += ", ".join(names)
+        if len(medium) > 5:
+            para += f", and {len(medium) - 5} others"
+        para += ". While these connections may require verification, they suggest shared professional circles and potential mutual acquaintances."
+        paragraphs.append(para)
+    
+    # Potential connections paragraph  
+    if potential:
+        para = f"**Potential Connections ({len(potential)} identified):** "
+        para += "Weaker or historical connections were also identified, including shared alumni networks, overlapping organizational affiliations in different time periods, or similar professional interests. "
+        para += "These represent possible relationship pathways that warrant further investigation during the cultivation process."
+        paragraphs.append(para)
+    
+    # Cultivation implications
+    if strong or medium:
+        para = "**Cultivation Implications:** "
+        if strong:
+            top_connector = strong[0].get('inner_circle_name', '')
+            para += f"The documented connection with {top_connector} provides an immediate warm introduction pathway. "
+        para += f"With {len(strong) + len(medium)} documented or likely connections to Inner Circle members, {name} is already embedded in networks adjacent to IHS. "
+        para += "This existing network proximity significantly enhances cultivation prospects and suggests natural affinity for IHS's mission and community."
+        paragraphs.append(para)
+    
+    return paragraphs
+
+def generate_network_section(R: Dict[str, Any]) -> List[str]:
+    """Generate Network & Board Affiliations section - about the DONOR'S OWN network and boards"""
+    paragraphs = []
+    
+    name = R.get('name', 'The donor')
+    
+    # Corporate and business boards
+    boards = R.get("nonprofit_boards", [])
+    current_pos = R.get("current_position", "")
+    
+    # Opening paragraph about network positioning
+    para = f"{name} maintains a professional network that spans "
+    network_areas = []
+    
+    if current_pos:
+        if "CEO" in current_pos or "President" in current_pos or "Chairman" in current_pos:
+            network_areas.append("executive business leadership")
+    
+    if boards:
+        network_areas.append("nonprofit governance")
+    
+    affiliations = R.get("other_affiliations", [])
+    if affiliations:
+        network_areas.append("civic engagement")
+    
+    if network_areas:
+        para += ", ".join(network_areas) + ". "
+    else:
+        para += "multiple professional domains. "
+    
+    para += "This network positioning provides access to diverse perspectives and relationship capital across sectors."
+    paragraphs.append(para)
+    
+    # Board service paragraph
+    if boards:
+        para = "**Nonprofit Board Service:** "
+        para += f"{name} demonstrates commitment to institutional leadership through board service with "
+        board_list = []
+        for b in boards[:5]:  # Show top 5 boards
+            org = b.get('org', '')
+            role = b.get('role', '')
+            if role and role != 'Member':
+                board_list.append(f"{org} ({role})")
+            else:
+                board_list.append(org)
+        
+        para += ", ".join(board_list)
+        if len(boards) > 5:
+            para += f", and {len(boards) - 5} additional organizations"
+        para += ". These governance roles provide direct access to other board members, donors, and organizational leaders within these institutions."
+        paragraphs.append(para)
+    
+    # Professional affiliations paragraph
+    if affiliations:
+        para = "**Professional Affiliations:** "
+        para += "Additional network access comes through affiliations with "
+        para += ", ".join(affiliations[:5])
+        if len(affiliations) > 5:
+            para += f", and {len(affiliations) - 5} other organizations"
+        para += ". These associations expand professional reach and provide connection points across multiple communities of interest."
+        paragraphs.append(para)
+    
+    # Network implications
+    if boards or affiliations:
+        para = "**Network Implications:** "
+        para += f"The breadth of {name}'s board service and affiliations suggests strong relationship-building capacity and comfort operating in networked professional environments. "
+        para += "This network sophistication is valuable for IHS cultivation, as it indicates potential for serving as a connector who could open doors to peer donors and institutional partnerships."
+        paragraphs.append(para)
+    else:
+        para = f"Specific board memberships and formal affiliations for {name} are being researched. "
+        para += "However, career achievements and professional positioning suggest active participation in relevant professional and civic networks."
+        paragraphs.append(para)
+    
+    return paragraphs
+
+def generate_networth_section(R: Dict[str, Any]) -> List[str]:
+    """Generate Estimated Net Worth & Giving Capacity section"""
+    paragraphs = []
+    
+    name = R.get('name', 'The donor')
+    nw_analysis = R.get("net_worth_analysis", {})
+    narrative = nw_analysis.get("narrative", [])
+    capacity_band = nw_analysis.get("capacity_band", "Moderate to High")
+    
+    # Opening assessment
+    para = f"While specific net worth figures for {name} are not publicly available, "
+    para += "multiple indicators suggest significant wealth and giving capacity. "
+    paragraphs.append(para)
+    
+    # Add detailed analysis points
+    current_pos = R.get("current_position", "")
+    previous_pos = R.get("previous_positions", [])
+    
+    if current_pos:
+        paragraphs.append(f"Current role as {current_pos} indicates executive-level compensation and likely equity positions.")
+    
+    if previous_pos:
+        paragraphs.append("Career trajectory through multiple leadership positions suggests accumulated wealth through "
+                         "high compensation packages, equity grants, and potential liquidity events.")
+    
+    # Add any existing narrative points
+    for item in narrative:
+        if item and "not yet assessed" not in item.lower():
+            paragraphs.append(item)
+    
+    # Capacity conclusion
+    paragraphs.append(f"Overall wealth and giving capacity assessment: {capacity_band}. "
+                     f"Based on career indicators and philanthropic engagement, {name} demonstrates "
+                     "capacity for major gifts and sustained charitable support.")
+    
+    return paragraphs
+
+def generate_ihs_assessment_narrative(R: Dict[str, Any], fec: Dict[str, Any], 
+                                      connections: List[Dict[str, Any]], 
+                                      inner_total: int) -> List[str]:
+    """Generate IHS A-E-I-N-P-S assessment in narrative format matching Steve Everist"""
+    paragraphs = []
+    
+    name = R.get('name', 'the donor')
+    
+    # Intro paragraph
+    paragraphs.append(f"Using IHS's A-E-I-N-P-S framework, here is an assessment of {name} as a prospective donor:")
+    
+    # Alignment (A)
+    alignment_score = "Moderate"
+    if fec and fec.get("found"):
+        byp = fec.get("by_party", {})
+        if byp.get('R', 0) > byp.get('D', 0) * 2:
+            alignment_score = "High"
+    
+    para = f"**Alignment (A): {alignment_score}.** "
+    if alignment_score == "High":
+        para += f"{name}'s political giving pattern demonstrates strong alignment with free-market principles and limited government. "
+        para += "Federal contributions favor Republican and liberty-oriented causes, suggesting values consonant with IHS's mission to advance liberty through education."
+    else:
+        para += f"Initial research suggests {name} holds values that may align with IHS's educational mission, though further engagement is needed to confirm ideological fit. "
+        para += "Philanthropic interests in education and individual empowerment provide potential common ground."
+    paragraphs.append(para)
+    
+    # Engagement (E)
+    engagement_score = "Low"
+    para = f"**Engagement (E): {engagement_score}.** "
+    para += f"To date, {name} has had minimal direct engagement with IHS or its sister organizations. "
+    para += "This represents an opportunity for cultivation through targeted outreach and relationship building."
+    paragraphs.append(para)
+    
+    # Interest (I)
+    interest_score = "Moderate"
+    para = f"**Interest (I): {interest_score}.** "
+    boards = R.get("nonprofit_boards", [])
+    if boards:
+        para += f"{name}'s board service with {', '.join([b.get('org', '')[:30] for b in boards[:2]])} demonstrates interest in education and social impact. "
+    para += "These philanthropic priorities suggest potential receptivity to IHS's academic programs and scholar development initiatives."
+    paragraphs.append(para)
+    
+    # Network (N)
+    network_score = "Moderate"
+    if connections and len([c for c in connections if c.get("strength_bucket") == "Strong"]) > 0:
+        network_score = "High"
+    
+    para = f"**Network (N): {network_score}** "
+    if network_score == "High":
+        strong_conns = [c for c in connections if c.get("strength_bucket") == "Strong"]
+        para += f"(regionally), Moderate (nationally). {name} has documented connections to {len(strong_conns)} Inner Circle members, "
+        para += "including " + ", ".join([c.get('inner_circle_name', '')[:25] for c in strong_conns[:3]]) + ". "
+        para += "These relationships provide warm introduction paths and mutual credibility."
+    else:
+        para += f". Network analysis against {inner_total} Inner Circle members identified potential connections through shared institutions and causes. "
+        para += "Further relationship mapping could reveal additional network pathways."
+    paragraphs.append(para)
+    
+    # Philanthropic Capacity (P)
+    capacity = R.get("net_worth_analysis", {}).get("capacity_band", "Moderate to High")
+    para = f"**Philanthropic Capacity (P): {capacity}.** "
+    para += f"{name}'s career achievements and sustained philanthropic engagement indicate significant giving capacity. "
+    para += "The donor falls into the tier capable of major gifts ($50,000-$250,000+) with proper cultivation and compelling case for support."
+    paragraphs.append(para)
+    
+    # Solicitation Potential (S)
+    sol_score = "Moderate"
+    para = f"**Solicitation Potential (S): {sol_score}.** "
+    para += f"Assessment suggests {name} is receptive to well-researched approaches that demonstrate impact and align with personal values. "
+    para += "Recommended strategy: warm introduction from mutual contact, followed by discovery conversation to understand philanthropic priorities, "
+    para += "culminating in a tailored proposal for a specific IHS program or initiative. "
+    para += "Initial ask range: $25,000-$100,000 depending on depth of engagement and program fit."
+    paragraphs.append(para)
+    
+    return paragraphs
+
+def generate_strategic_summary(R: Dict[str, Any], connections: List[Dict[str, Any]]) -> List[str]:
+    """Generate Strategic Summary (Board-Level Briefing)"""
+    paragraphs = []
+    
+    name = R.get('name', 'the donor')
+    current_pos = R.get("current_position", "")
+    location = f"{R.get('City', '')}, {R.get('State', '')}" if R.get('City') else ""
+    
+    # Profile overview
+    para = f"**Profile Overview:** {name}"
+    if current_pos:
+        para += f", {current_pos},"
+    if location:
+        para += f" based in {location},"
+    para += " is a prospective major donor with capacity and potential alignment for IHS support. "
+    
+    # Add connection strength
+    strong_conns = [c for c in connections if c.get("strength_bucket") == "Strong"]
+    if strong_conns:
+        para += f"Documented connections to {len(strong_conns)} Inner Circle members provide warm introduction opportunities. "
+    
+    paragraphs.append(para)
+    
+    # Recommended approach
+    para = "**Recommended Next Steps:** "
+    if strong_conns:
+        connector = strong_conns[0].get('inner_circle_name', 'mutual contact')
+        para += f"(1) Request warm introduction through {connector}. "
+    else:
+        para += "(1) Conduct additional research to identify warm introduction paths. "
+    
+    para += "(2) Schedule discovery call to understand philanthropic priorities and assess program fit. "
+    para += "(3) Develop tailored cultivation strategy with specific program proposals aligned to donor interests. "
+    para += "(4) Position initial solicitation in $25,000-$100,000 range for targeted initiative."
+    paragraphs.append(para)
+    
+    return paragraphs
+
+def build_networth_analysis(R: Dict[str, Any], foundation_assets=None):
+    narrative = []
+    if R.get("previous_positions"):
+        narrative.append("Career includes multiple top executive roles with likely high compensation and equity exposure.")
+    if foundation_assets is not None:
+        narrative.append(
+            f"Family foundation reports ~{fmt_money(foundation_assets)} in assets per IRS 990 filings, "
+            f"indicating sustained charitable capacity."
+        )
+    capacity_band = "High" if foundation_assets and foundation_assets >= 2_000_000 else "Moderate to High"
+    return {
+        "narrative": narrative if narrative else ["Capacity not yet assessed."],
+        "capacity_band": capacity_band
+    }
+
+def collect_all_citations(R: Dict[str, Any], fec: Dict[str, Any], connections: List[Dict[str, Any]]) -> List[str]:
+    """Collect and deduplicate all source URLs used in research"""
+    all_urls = set()
+    
+    # Biographical sources
+    for url in R.get("bio_sources", []):
+        if url and url.strip():
+            all_urls.add(url.strip())
+    
+    # Career sources
+    for url in R.get("career_sources", []):
+        if url and url.strip():
+            all_urls.add(url.strip())
+    
+    # Philanthropic sources
+    for url in R.get("philanthropy_sources", []):
+        if url and url.strip():
+            all_urls.add(url.strip())
+    
+    # FEC profile URL
+    if fec.get("profile_url"):
+        all_urls.add(fec["profile_url"])
+    
+    # Connection citations
+    for conn in connections:
+        for cite in conn.get("citations", []):
+            if cite and cite.strip():
+                all_urls.add(cite.strip())
+        # Also check source field
+        if conn.get("source"):
+            all_urls.add(conn["source"].strip())
+    
+    # Sort alphabetically for consistency
+    return sorted(list(all_urls))
+
+def generate_citations_section(all_citations: List[str]) -> List[str]:
+    """Generate a formatted citations section"""
+    if not all_citations:
+        return ["No external sources were cited in this research."]
+    
+    intro = (
+        f"This profile was compiled using {len(all_citations)} source(s), including biographical databases, "
+        f"news articles, organizational websites, government records, and public documents. "
+        f"All sources were accessed during the research period and are listed below for verification and further investigation."
+    )
+    
+    # Create a formatted list paragraph
+    citation_lines = [intro, ""]  # Empty string creates paragraph break
+    citation_lines.append("**Research Sources:**")
+    citation_lines.append("")
+    
+    for i, url in enumerate(all_citations, 1):
+        citation_lines.append(f"{i}. {url}")
+    
+    # Join into paragraphs - the render function will handle each line
+    return [intro, "\n".join([f"{i}. {url}" for i, url in enumerate(all_citations, 1)])]
+
+# -------------------------
+# MAIN
+# -------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="IHS Hybrid Donor Research System - Optimized Edition"
+    )
+    parser.add_argument("--name", help="Process specific donor by name")
+    parser.add_argument("--data", default="data.csv", help="Path to donor data CSV")
+    parser.add_argument("--inner", help="Path to inner circle CSV (auto-detects Inner_Circle.csv)")
+    parser.add_argument("--outdir", default=".", help="Output directory")
+    parser.add_argument("--test-mode", action="store_true",
+                       help="TEST MODE: Process only the FIRST donor (for testing)")
+    args = parser.parse_args()
+    
+    log.info("="*70)
+    log.info("IHS HYBRID DONOR RESEARCH SYSTEM - NARRATIVE FORMAT EDITION")
+    log.info("="*70)
+    log.info(f"OpenAI Library: {OPENAI_VERSION if OPENAI_VERSION else 'Not installed'}")
+    log.info(f"OpenAI Model: {OPENAI_MODEL}")
+    log.info(f"Search Provider: {SEARCH_PROVIDER.upper()}")
+    if SEARCH_PROVIDER == "google" and GOOGLE_API_KEYS:
+        log.info(f"Google API Keys: {len(GOOGLE_API_KEYS)} keys loaded")
+        log.info(f"  → Smart key switching: Automatically rotates on rate limits")
+        if len(GOOGLE_API_KEYS) > 1:
+            log.info(f"  → Combined quota: ~{len(GOOGLE_API_KEYS) * 10000:,} queries/day")
+    log.info("")
+    
+    # Load data
+    data_rows = load_csv(args.data)
+    if not data_rows:
+        log.error(f"No rows found in {args.data}")
+        return
+    
+    # Load inner circle
+    if args.inner:
+        inner_path = args.inner
+    else:
+        for candidate in ("Inner_Circle.csv", "inner_circle.csv"):
+            if os.path.exists(candidate):
+                inner_path = candidate
+                break
+        else:
+            log.error("Inner circle file not found. Please specify with --inner or ensure Inner_Circle.csv exists.")
+            return
+    
+    inner_rows = load_csv(inner_path)
+    inner_circle_count = len(inner_rows)
+    log.info(f"Loaded {inner_circle_count} inner circle members from {inner_path}")
+    
+    # Determine which donors to process
+    if args.test_mode:
+        # TEST MODE: Process only first donor
+        first_name = get_row_name(data_rows[0])
+        if not first_name:
+            log.error("First donor has no valid name")
+            return
+        names_to_process = [first_name]
+        log.info(f"🧪 TEST MODE: Processing ONLY first donor: {first_name}")
+    elif args.name:
+        # Single donor mode
+        names_to_process = [args.name.strip()]
+    else:
+        # Process all donors
+        names_to_process = [get_row_name(r) for r in data_rows if get_row_name(r)]
+        if not names_to_process:
+            log.error(f"No valid names found in {args.data}")
+            return
+        log.info(f"Processing {len(names_to_process)} donors from {args.data}")
+    
+    # Process each donor
+    for donor_name in names_to_process:
+        log.info(f"\n{'='*60}")
+        log.info(f"Processing: {donor_name}")
+        log.info(f"{'='*60}")
+        
+        donor_row = find_donor_in_data(data_rows, donor_name)
+        if not donor_row:
+            log.warning(f"Skipping: '{donor_name}' not found in {args.data}")
+            continue
+        
+        try:
+            # 1) Profile + Deep Biographical Research
+            log.info("Extracting profile with deep biographical research...")
+            R = extract_profile(donor_name)
+            R["City"] = donor_row.get("City", "")
+            R["State"] = donor_row.get("State", "")
             
-            log(f"\n[OK] COMPLETED: {person['first']} {person.get('last','')}")
-            log(f"  Document: {docx_path}")
+            # 2) Deep Career Research
+            log.info("Conducting deep career narrative research...")
+            deep_career, career_sources = extract_deep_career(donor_name)
+            R["deep_career_narrative"] = deep_career
+            R["career_sources"] = career_sources
             
-            # Summary
-            strong_connections = sum(1 for c in prof.get('inner_circle_connections', []) 
-                                   if c['connection_strength'] >= 50)
-            log(f"  Summary:")
-            log(f"     * Strong connections: {strong_connections}")
-            log(f"     * Total evidence: {sum(c['evidence_count'] for c in prof.get('inner_circle_connections', []))}")
-            log(f"     * Political giving: ${prof.get('political_analysis', {}).get('total_given', 0):,.0f}")
+            # 2.5) Deep Philanthropy Research
+            log.info("Conducting deep philanthropic research...")
+            deep_philanthropy, philanthropy_sources = extract_deep_philanthropy(donor_name)
+            R["deep_philanthropy_narrative"] = deep_philanthropy
+            R["philanthropy_sources"] = philanthropy_sources
+            
+            # 3) FEC
+            log.info("Researching FEC giving...")
+            fec = research_fec(donor_name)
+            R["political_contributions"] = fec
+            
+            # 4) Inner Circle
+            log.info(f"Starting deep comparison against {inner_circle_count} inner circle members...")
+            connections, conn_cites = research_inner_circle(R, inner_rows)
+            R["connections"] = connections
+            
+            # 5) Net Worth
+            foundation_assets = R.get("foundation_assets", None)
+            R["net_worth_analysis"] = build_networth_analysis(R, foundation_assets=foundation_assets)
+            
+            # 6) DOCX Report - NARRATIVE FORMAT (9 sections matching your requirement)
+            doc = Document()
+            
+            # Store inner_circle_count in R for later use
+            R['inner_circle_count'] = inner_circle_count
+            
+            # Title
+            render_title(doc, R['name'])
+            
+            # 1. Biographical Background & Education
+            bio_paragraphs = generate_biographical_section(R)
+            render_narrative_section(doc, "Biographical Background & Education", bio_paragraphs)
+            
+            # 2. Career History & Business Leadership
+            career_paragraphs = generate_career_section(R)
+            render_narrative_section(doc, "Career History & Business Leadership", career_paragraphs)
+            
+            # 3. Philanthropic Activities & Causes Supported
+            philanthropy_paragraphs = generate_philanthropic_section(R)
+            render_narrative_section(doc, "Philanthropic Activities & Causes Supported", philanthropy_paragraphs)
+            
+            # 4. Political Donations & Ideological Leanings
+            political_paragraphs = generate_political_section(R, fec)
+            render_narrative_section(doc, "Political Donations & Ideological Leanings", political_paragraphs)
+            
+            # 5. Connections (Inner Circle Comparison - NEW SECTION!)
+            connections_paragraphs = generate_connections_section(R, connections, inner_circle_count)
+            render_narrative_section(doc, "Connections", connections_paragraphs)
+            
+            # 6. Network & Board Affiliations (Donor's Own Network)
+            network_paragraphs = generate_network_section(R)
+            render_narrative_section(doc, "Network & Board Affiliations", network_paragraphs)
+            
+            # 7. Estimated Net Worth & Giving Capacity
+            networth_paragraphs = generate_networth_section(R)
+            render_narrative_section(doc, "Estimated Net Worth & Giving Capacity", networth_paragraphs)
+            
+            # 8. IHS Donor Probability Model Assessment
+            ihs_paragraphs = generate_ihs_assessment_narrative(R, fec, connections, inner_circle_count)
+            render_narrative_section(doc, "IHS Donor Probability Model Assessment", ihs_paragraphs)
+            
+            # 9. Strategic Summary (Board-Level Briefing)
+            summary_paragraphs = generate_strategic_summary(R, connections)
+            render_narrative_section(doc, "Strategic Summary (Board-Level Briefing)", summary_paragraphs)
+            
+            # 10. Sources & Citations (NEW SECTION!)
+            all_citations = collect_all_citations(R, fec, connections)
+            citations_paragraphs = generate_citations_section(all_citations)
+            render_narrative_section(doc, "Sources & Citations", citations_paragraphs)
+            
+            # 7) Save
+            outpath = os.path.join(args.outdir, f"{R['name'].replace(' ', '_')}_Donor_Profile.docx")
+            doc.save(outpath)
+            log.info(f"✅ Report written: {outpath}")
+            log.info(f"Completed: {donor_name}\n")
             
         except Exception as e:
-            log(f"\n[ERROR]: {e}")
+            log.error(f"❌ Failed processing {donor_name}: {e}")
             import traceback
             traceback.print_exc()
             continue
-        
-        if i < len(batch) - 1:
-            log("\n  Waiting 5 seconds before next prospect...")
-            time.sleep(5)
     
-    log(f"\n{'='*70}")
-    log(f"[OK] ALL RESEARCH COMPLETE")
-    log(f"  Processed: {len(batch)} prospects")
-    log(f"  Output: ./outputs/")
-    log(f"{'='*70}")
+    log.info(f"\n{'='*60}")
+    log.info(f"✅ ALL DONE! Processed {len(names_to_process)} donor(s)")
+    log.info(f"{'='*60}")
 
 if __name__ == "__main__":
     main()
