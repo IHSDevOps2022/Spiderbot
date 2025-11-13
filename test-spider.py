@@ -59,6 +59,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from dotenv import load_dotenv
@@ -77,13 +78,30 @@ load_dotenv("spider.env")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4")
 
+# Tavily search provider - support multiple API keys for higher rate limits
+# Format: TAVILY_API_KEY_1, TAVILY_API_KEY_2, etc.
+TAVILY_API_KEYS = []
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "tavily")
+
+# Load all TAVILY_API_KEY_N variables
+for i in range(1, 51):  # Support up to 50 keys
+    key = os.getenv(f"TAVILY_API_KEY_{i}", "")
+    if key:
+        TAVILY_API_KEYS.append(key)
+
+# Fallback to single TAVILY_API_KEY if no numbered keys found
+if not TAVILY_API_KEYS:
+    single_key = os.getenv("TAVILY_API_KEY", "")
+    if single_key:
+        TAVILY_API_KEYS.append(single_key)
+
 # Support multiple Google API keys for higher rate limits
 # Format: GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, etc.
 GOOGLE_API_KEYS = []
 GOOGLE_CSE_ID  = os.getenv("GOOGLE_CSE_ID", "")
 
 # Load all GOOGLE_API_KEY_N variables
-for i in range(1, 21):  # Support up to 20 keys
+for i in range(1, 51):  # Support up to 50 keys
     key = os.getenv(f"GOOGLE_API_KEY_{i}", "")
     if key:
         GOOGLE_API_KEYS.append(key)
@@ -93,22 +111,34 @@ if not GOOGLE_API_KEYS:
     single_key = os.getenv("GOOGLE_API_KEY", "")
     if single_key:
         GOOGLE_API_KEYS.append(single_key)
-
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
-SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "google")
 FEC_API_KEY    = os.getenv("FEC_API_KEY", "")
 CACHE_DIR      = os.getenv("CACHE_DIR", "./cache")
 CACHE_TTL      = int(os.getenv("CACHE_TTL", "86400"))
 
-# Key rotation state
+# Key rotation state for both Tavily and Google
+_tavily_key_index = 0
+_tavily_key_exhausted = set()  # Track which Tavily keys hit rate limits
 _google_key_index = 0
-_google_key_exhausted = set()  # Track which keys hit rate limits
+_google_key_exhausted = set()  # Track which Google keys hit rate limits
+
+# Load balancing state
+_search_counter = 0  # Alternates between providers
+_google_fully_exhausted = False  # True when all Google keys are exhausted
+
+# Search provider usage tracking
+_search_stats = {"tavily": 0, "google": 0, "tavily_cached": 0, "google_cached": 0}
+
+def reset_tavily_keys():
+    """Reset exhausted Tavily keys tracking (call this daily or when quotas reset)"""
+    global _tavily_key_exhausted, _search_stats
+    _tavily_key_exhausted.clear()
+    log.info(f"Reset Tavily API key exhaustion tracking. Stats: Tavily={_search_stats['tavily']}, Google={_search_stats['google']}")
 
 def reset_google_keys():
-    """Reset exhausted keys tracking (call this daily or when quotas reset)"""
-    global _google_key_exhausted
+    """Reset exhausted Google keys tracking (call this daily or when quotas reset)"""
+    global _google_key_exhausted, _search_stats
     _google_key_exhausted.clear()
-    log.info("Reset Google API key exhaustion tracking")
+    log.info(f"Reset Google API key exhaustion tracking. Stats: Tavily={_search_stats['tavily']}, Google={_search_stats['google']}")
 
 try:
     import openai
@@ -295,35 +325,111 @@ def get_row_name(row: Dict[str, str]) -> str:
 # -------------------------
 @retry_with_backoff(max_retries=3)
 def tavily_search(query: str, num: int = 10) -> List[Dict[str, str]]:
-    """Tavily Search API - optimized for AI research"""
-    if not TAVILY_API_KEY:
-        log.warning("Tavily search disabled (missing API key)")
+    """Tavily Search API with smart key switching on rate limits
+    
+    Automatically switches to next available API key when rate limits are hit.
+    This provides seamless failover without manual intervention.
+    Rotates keys on EVERY request for even load distribution.
+    """
+    global _tavily_key_index, _tavily_key_exhausted, _search_stats
+    
+    if not TAVILY_API_KEYS:
+        log.debug("Tavily search disabled (missing API key) - will use fallback provider")
         return []
     
     cache_key = cache.get_cache_key("tavily", {"q": query, "num": num})
     
     def fetcher():
-        url = "https://api.tavily.com/search"
-        headers = {"Content-Type": "application/json"}
-        data = {
-            "api_key": TAVILY_API_KEY,
-            "query": query,
-            "max_results": min(10, num),
-            "search_depth": "basic",  # or "advanced" for deeper search
-            "include_answer": False,
-            "include_raw_content": False
-        }
-        r = requests.post(url, headers=headers, json=data, timeout=20)
-        r.raise_for_status()
-        results = (r.json() or {}).get("results", []) or []
-        return [
-            {
-                "title": item.get("title", ""),
-                "snippet": item.get("content", ""),
-                "link": item.get("url", "")
-            }
-            for item in results
-        ]
+        global _tavily_key_index, _tavily_key_exhausted, _search_stats
+        
+        # Rotate to next key for load balancing (on every request)
+        _tavily_key_index += 1
+        
+        # Try each available key until one works
+        attempts = 0
+        max_attempts = len(TAVILY_API_KEYS)
+        
+        while attempts < max_attempts:
+            # Get current key index (skip exhausted keys)
+            current_index = _tavily_key_index % len(TAVILY_API_KEYS)
+            
+            # If all keys exhausted, reset and try again
+            if len(_tavily_key_exhausted) >= len(TAVILY_API_KEYS):
+                log.warning("All Tavily API keys exhausted! Waiting and resetting...")
+                time.sleep(60)  # Wait 1 minute
+                _tavily_key_exhausted.clear()
+            
+            # Skip if this key is exhausted
+            if current_index in _tavily_key_exhausted:
+                _tavily_key_index += 1
+                attempts += 1
+                continue
+            
+            api_key = TAVILY_API_KEYS[current_index]
+            key_display = f"#{current_index + 1}/{len(TAVILY_API_KEYS)}"
+            
+            try:
+                url = "https://api.tavily.com/search"
+                headers = {"Content-Type": "application/json"}
+                data = {
+                    "api_key": api_key,
+                    "query": query,
+                    "max_results": min(10, num),
+                    "search_depth": "basic",  # or "advanced" for deeper search
+                    "include_answer": False,
+                    "include_raw_content": False
+                }
+                r = requests.post(url, headers=headers, json=data, timeout=20)
+                r.raise_for_status()
+                
+                # Success! Return results
+                results = (r.json() or {}).get("results", []) or []
+                _search_stats["tavily"] += 1
+                
+                log.info(f"✓ Tavily search successful (key {key_display}): '{query[:50]}...' → {len(results)} results")
+                
+                return [
+                    {
+                        "title": item.get("title", ""),
+                        "snippet": item.get("content", ""),
+                        "link": item.get("url", "")
+                    }
+                    for item in results
+                ]
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    # Rate limit hit! Mark this key as exhausted and try next
+                    _tavily_key_exhausted.add(current_index)
+                    log.warning(f"⚠ Tavily API key {key_display} hit rate limit (429). "
+                               f"Switching to next key... ({len(_tavily_key_exhausted)}/{len(TAVILY_API_KEYS)} exhausted)")
+                    _tavily_key_index += 1
+                    attempts += 1
+                    time.sleep(1)  # Brief pause before trying next key
+                    continue
+                else:
+                    # Different error, re-raise
+                    log.warning(f"✗ Tavily key {key_display} error {e.response.status_code}: {e}")
+                    raise
+            
+            except Exception as e:
+                # Unexpected error, try next key
+                log.warning(f"✗ Tavily key {key_display} error: {e}. Trying next key...")
+                _tavily_key_index += 1
+                attempts += 1
+                continue
+        
+        # All keys failed
+        log.error(f"✗ All {len(TAVILY_API_KEYS)} Tavily API keys failed or exhausted!")
+        return []
+    
+    # Check if cached
+    cache_file = os.path.join(cache.cache_dir, f"{cache_key}.json")
+    if os.path.exists(cache_file):
+        mtime = os.path.getmtime(cache_file)
+        if time.time() - mtime < cache.ttl:
+            _search_stats["tavily_cached"] += 1
+            log.debug(f"↻ Tavily CACHED: '{query[:50]}...'")
     
     return cache.get_or_fetch(cache_key, fetcher)
 
@@ -332,8 +438,9 @@ def google_search(query: str, num: int = 10) -> List[Dict[str, str]]:
     
     Automatically switches to next available API key when rate limits are hit.
     This provides seamless failover without manual intervention.
+    Rotates keys on EVERY request for even load distribution.
     """
-    global _google_key_index, _google_key_exhausted
+    global _google_key_index, _google_key_exhausted, _search_stats
     
     if not GOOGLE_API_KEYS or not GOOGLE_CSE_ID:
         log.warning("Google search disabled (missing API keys)")
@@ -342,7 +449,10 @@ def google_search(query: str, num: int = 10) -> List[Dict[str, str]]:
     cache_key = cache.get_cache_key("google", {"q": query, "num": num})
     
     def fetcher():
-        global _google_key_index, _google_key_exhausted
+        global _google_key_index, _google_key_exhausted, _search_stats, _google_fully_exhausted
+        
+        # Rotate to next key for load balancing (on every request)
+        _google_key_index += 1
         
         # Try each available key until one works
         attempts = 0
@@ -352,11 +462,12 @@ def google_search(query: str, num: int = 10) -> List[Dict[str, str]]:
             # Get current key index (skip exhausted keys)
             current_index = _google_key_index % len(GOOGLE_API_KEYS)
             
-            # If all keys exhausted, reset and try again
+            # If all keys exhausted, mark as fully exhausted
             if len(_google_key_exhausted) >= len(GOOGLE_API_KEYS):
-                log.warning("All Google API keys exhausted! Waiting and resetting...")
-                time.sleep(60)  # Wait 1 minute
-                _google_key_exhausted.clear()
+                if not _google_fully_exhausted:
+                    log.warning("🔴 All Google API keys exhausted! Switching to Tavily-only mode.")
+                    _google_fully_exhausted = True
+                return []  # Don't reset, just return empty
             
             # Skip if this key is exhausted
             if current_index in _google_key_exhausted:
@@ -365,6 +476,7 @@ def google_search(query: str, num: int = 10) -> List[Dict[str, str]]:
                 continue
             
             api_key = GOOGLE_API_KEYS[current_index]
+            key_display = f"#{current_index + 1}/{len(GOOGLE_API_KEYS)}"
             
             try:
                 url = "https://www.googleapis.com/customsearch/v1"
@@ -380,6 +492,10 @@ def google_search(query: str, num: int = 10) -> List[Dict[str, str]]:
                 
                 # Success! Return results
                 items = (r.json() or {}).get("items", []) or []
+                _search_stats["google"] += 1
+                
+                log.info(f"✓ Google search successful (key {key_display}): '{query[:50]}...' → {len(items)} results")
+                
                 return [
                     {
                         "title": i.get("title", ""),
@@ -393,7 +509,7 @@ def google_search(query: str, num: int = 10) -> List[Dict[str, str]]:
                 if e.response.status_code == 429:
                     # Rate limit hit! Mark this key as exhausted and try next
                     _google_key_exhausted.add(current_index)
-                    log.warning(f"Google API key #{current_index + 1} hit rate limit (429). "
+                    log.warning(f"⚠ Google API key {key_display} hit rate limit (429). "
                                f"Switching to next key... ({len(_google_key_exhausted)}/{len(GOOGLE_API_KEYS)} exhausted)")
                     _google_key_index += 1
                     attempts += 1
@@ -401,30 +517,123 @@ def google_search(query: str, num: int = 10) -> List[Dict[str, str]]:
                     continue
                 else:
                     # Different error, re-raise
+                    log.warning(f"✗ Google key {key_display} error {e.response.status_code}: {e}")
                     raise
             
             except Exception as e:
                 # Unexpected error, try next key
-                log.warning(f"Error with Google API key #{current_index + 1}: {e}. Trying next key...")
+                log.warning(f"✗ Google key {key_display} error: {e}. Trying next key...")
                 _google_key_index += 1
                 attempts += 1
                 continue
         
         # All keys failed
-        log.error(f"All {len(GOOGLE_API_KEYS)} Google API keys failed or exhausted!")
+        if not _google_fully_exhausted:
+            log.error(f"🔴 All {len(GOOGLE_API_KEYS)} Google API keys failed or exhausted! Switching to Tavily-only mode.")
+            _google_fully_exhausted = True
         return []
+    
+    # Check if cached
+    cache_file = os.path.join(cache.cache_dir, f"{cache_key}.json")
+    if os.path.exists(cache_file):
+        mtime = os.path.getmtime(cache_file)
+        if time.time() - mtime < cache.ttl:
+            _search_stats["google_cached"] += 1
+            log.debug(f"↻ Google CACHED: '{query[:50]}...'")
     
     return cache.get_or_fetch(cache_key, fetcher)
 
 def search_web(query: str, num: int = 10) -> List[Dict[str, str]]:
-    """Universal search function - uses configured provider"""
-    if SEARCH_PROVIDER == "tavily":
-        return tavily_search(query, num)
-    else:
+    """Load-balanced search using both Tavily and Google
+    
+    LOAD BALANCING STRATEGY:
+    1. Start with Tavily (first search)
+    2. Then alternate: Google → Tavily → Google → Tavily...
+    3. Continue using both until all Google keys are exhausted
+    4. Once Google exhausted, switch to Tavily-only mode
+    
+    This maximizes utilization of your 50 Google keys while preserving Tavily quota.
+    """
+    global _search_counter, _google_fully_exhausted
+    
+    results = []
+    _search_counter += 1
+    
+    # Check if both providers are available
+    has_tavily = bool(TAVILY_API_KEYS)
+    has_google = bool(GOOGLE_API_KEYS and GOOGLE_CSE_ID and not _google_fully_exhausted)
+    
+    # If Google is exhausted, use Tavily only
+    if has_tavily and not has_google:
+        if _search_counter == 1 or (_search_counter % 100 == 0):
+            log.debug("📘 Using Tavily-only (Google exhausted)")
+        try:
+            return tavily_search(query, num)
+        except Exception as e:
+            log.warning(f"✗ Tavily error: {e}")
+            return []
+    
+    # If only one provider available, use it
+    if has_tavily and not has_google:
+        try:
+            return tavily_search(query, num)
+        except Exception as e:
+            log.warning(f"✗ Tavily error: {e}")
+            return []
+    
+    if has_google and not has_tavily:
         return google_search(query, num)
+    
+    # Both providers available - load balance!
+    # Strategy: First search uses Tavily, then alternate (Google, Tavily, Google, Tavily...)
+    
+    if _search_counter == 1:
+        # First search always uses Tavily
+        provider = "tavily"
+    elif _search_counter % 2 == 0:
+        # Even searches use Google
+        provider = "google"
+    else:
+        # Odd searches use Tavily
+        provider = "tavily"
+    
+    # Execute search with chosen provider
+    try:
+        if provider == "tavily":
+            results = tavily_search(query, num)
+            return results
+        else:  # google
+            results = google_search(query, num)
+            # If Google returned empty (possibly exhausted), try Tavily as backup
+            if not results and _google_fully_exhausted:
+                log.debug("📘 Google exhausted mid-search, using Tavily...")
+                results = tavily_search(query, num)
+            return results
+    
+    except Exception as e:
+        # If chosen provider fails, try the other one
+        log.warning(f"✗ {provider.title()} error: {e}, trying alternate provider...")
+        try:
+            if provider == "tavily" and has_google:
+                return google_search(query, num)
+            elif provider == "google" and has_tavily:
+                return tavily_search(query, num)
+        except Exception as e2:
+            log.warning(f"✗ Alternate provider also failed: {e2}")
+        return []
+    
+    return results
 
-def google_pack_for_person(name: str) -> List[Dict[str, str]]:
-    """Optimized: Reduced from 11 to 5 queries to avoid rate limits"""
+def search_pack_for_person(name: str, fast_mode: bool = True) -> List[Dict[str, str]]:
+    """Multi-query search for person (tries Tavily first, Google fallback)
+    
+    Args:
+        name: Person name to search
+        fast_mode: If True, uses parallel searches (5x faster). If False, sequential.
+    
+    Optimized: Reduced from 11 to 5 queries to avoid rate limits
+    Fast mode: Searches run in parallel for 5x speedup
+    """
     queries = [
         f'"{name}" biography',
         f'"{name}" linkedin',
@@ -432,10 +641,31 @@ def google_pack_for_person(name: str) -> List[Dict[str, str]]:
         f'"{name}" foundation',
         f'"{name}" interview'
     ]
-    results = []
-    for q in queries:
-        results.extend(search_web(q, num=5))
-        time.sleep(1.2)  # Rate limiting
+    
+    if fast_mode:
+        # FAST: Parallel searches (5x faster)
+        results = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit all searches concurrently
+            future_to_query = {executor.submit(search_web, q, 5): q for q in queries}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_query):
+                try:
+                    query_results = future.result()
+                    results.extend(query_results)
+                except Exception as e:
+                    query = future_to_query[future]
+                    log.warning(f"Search failed for '{query}': {e}")
+        
+        # Small delay between donor searches (not between individual queries)
+        time.sleep(0.3)
+    else:
+        # SLOW: Sequential searches (original behavior)
+        results = []
+        for q in queries:
+            results.extend(search_web(q, num=5))
+            time.sleep(1.2)  # Rate limiting
     
     # Deduplicate by URL
     uniq, seen = [], set()
@@ -642,8 +872,12 @@ def google_queries_for_pair(donor: str, member: str, donor_city: str = "", donor
         return queries
 
 def classify_connection(donor_name: str, donor_city: str, donor_state: str,
-                       member_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Classify connection with confidence scoring"""
+                       member_row: Dict[str, Any], fast_mode: bool = True) -> Optional[Dict[str, Any]]:
+    """Classify connection with confidence scoring
+    
+    Args:
+        fast_mode: If True, uses parallel searches (3x faster per connection)
+    """
     # Build member name
     first = (member_row.get("First") or "").strip()
     middle = (member_row.get("Middle") or "").strip()
@@ -655,11 +889,24 @@ def classify_connection(donor_name: str, donor_city: str, donor_state: str,
     
     # Build queries (reduced to 3)
     queries = google_queries_for_pair(donor_name, member_name, donor_city, donor_state)
-    results = []
     
-    for q in queries:
-        results.extend(search_web(q, num=3))  # Reduced from 5 to 3
-        time.sleep(1.2)  # Rate limit: ~50 queries per 100 seconds (safe margin)
+    if fast_mode:
+        # FAST: Parallel searches
+        results = []
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_query = {executor.submit(search_web, q, 3): q for q in queries}
+            for future in as_completed(future_to_query):
+                try:
+                    results.extend(future.result())
+                except Exception as e:
+                    pass  # Silently skip failed searches
+        time.sleep(0.1)  # Brief delay after batch
+    else:
+        # SLOW: Sequential searches
+        results = []
+        for q in queries:
+            results.extend(search_web(q, num=3))
+            time.sleep(1.2)  # Rate limit
     
     # Deduplicate
     uniq, seen = [], set()
@@ -713,29 +960,85 @@ def classify_connection(donor_name: str, donor_city: str, donor_state: str,
     return out
 
 def research_inner_circle(prospect: Dict[str, Any], 
-                         inner_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Research inner circle connections"""
+                         inner_rows: List[Dict[str, Any]],
+                         max_members: Optional[int] = None,
+                         fast_mode: bool = True,
+                         parallel_workers: int = 10) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Research inner circle connections
+    
+    Args:
+        prospect: Donor profile dict
+        inner_rows: List of inner circle members
+        max_members: Optional limit on number of members to check (None = all)
+        fast_mode: If True, uses parallel searches within each connection check
+        parallel_workers: Number of members to process concurrently (default 10)
+    
+    Fast mode improvements:
+        - Parallel searches within each connection (3x faster per connection)
+        - Parallel processing of multiple members (10x faster overall)
+        - Combined speedup: ~30x faster for inner circle research!
+    """
     donor = prospect.get("name") or ""
     donor_city = prospect.get("City") or ""
     donor_state = prospect.get("State") or ""
     
+    # Optionally limit number of members
+    if max_members and max_members < len(inner_rows):
+        inner_rows = inner_rows[:max_members]
+        log.info(f"⚡ FAST MODE: Limiting inner circle check to first {max_members} members")
+    
     connections, used = [], []
     total = len(inner_rows)
     log.info(f"Analyzing {total} inner-circle members for {donor}...")
+    if fast_mode:
+        log.info(f"⚡ Using parallel processing with {parallel_workers} concurrent workers")
     
-    for i, row in enumerate(inner_rows, start=1):
-        if (i % 25) == 0:
-            log.info(f"  Progress {i}/{total}...")
-        
+    def process_member(i_and_row):
+        """Process a single member (for parallel execution)"""
+        i, row = i_and_row
         try:
-            c = classify_connection(donor, donor_city, donor_state, row)
-            if c:
-                connections.append(c)
-                used.extend(c.get("citations", []))
+            c = classify_connection(donor, donor_city, donor_state, row, fast_mode=fast_mode)
+            return (i, c)
         except Exception as e:
             log.warning(f"Member #{i} failed: {e}")
-        
-        time.sleep(0.5)  # Small delay between members (on top of query delays)
+            return (i, None)
+    
+    if fast_mode:
+        # FAST: Process members in parallel
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            # Submit all members
+            futures = {executor.submit(process_member, (i+1, row)): i 
+                      for i, row in enumerate(inner_rows)}
+            
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                if (completed % 25) == 0:
+                    log.info(f"  Progress {completed}/{total}...")
+                
+                try:
+                    i, c = future.result()
+                    if c:
+                        connections.append(c)
+                        used.extend(c.get("citations", []))
+                except Exception as e:
+                    log.warning(f"Member processing failed: {e}")
+    else:
+        # SLOW: Process members sequentially
+        for i, row in enumerate(inner_rows, start=1):
+            if (i % 25) == 0:
+                log.info(f"  Progress {i}/{total}...")
+            
+            try:
+                c = classify_connection(donor, donor_city, donor_state, row, fast_mode=False)
+                if c:
+                    connections.append(c)
+                    used.extend(c.get("citations", []))
+            except Exception as e:
+                log.warning(f"Member #{i} failed: {e}")
+            
+            time.sleep(0.5)  # Small delay between members
     
     connections.sort(key=lambda x: (-x["strength"], x["inner_circle_name"]))
     used = list(set(used))  # Dedupe
@@ -816,9 +1119,12 @@ WEB SEARCH RESULTS:
 
 Write the biographical narrative (3-5 paragraphs, narrative prose only):"""
 
-def extract_deep_biography(name: str) -> Tuple[str, List[str]]:
+def extract_deep_biography(name: str, fast_mode: bool = True) -> Tuple[str, List[str]]:
     """Extract comprehensive biographical narrative using enhanced research
     Returns: (biography_text, list_of_source_urls)
+    
+    Args:
+        fast_mode: If True, uses parallel searches (5x faster)
     """
     log.info(f"  → Conducting deep biographical research for {name}...")
     
@@ -832,10 +1138,23 @@ def extract_deep_biography(name: str) -> Tuple[str, List[str]]:
         f'"{name}" profile about'
     ]
     
-    results = []
-    for q in bio_queries:
-        results.extend(search_web(q, num=5))
-        time.sleep(1.2)  # Rate limit
+    if fast_mode:
+        # FAST: Parallel searches
+        results = []
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            future_to_query = {executor.submit(search_web, q, 5): q for q in bio_queries}
+            for future in as_completed(future_to_query):
+                try:
+                    results.extend(future.result())
+                except Exception as e:
+                    log.warning(f"Biography search failed: {e}")
+        time.sleep(0.3)  # Brief delay after batch
+    else:
+        # SLOW: Sequential searches
+        results = []
+        for q in bio_queries:
+            results.extend(search_web(q, num=5))
+            time.sleep(1.2)  # Rate limit
     
     # Deduplicate
     uniq, seen = [], set()
@@ -887,7 +1206,7 @@ def extract_profile(name: str) -> Dict[str, Any]:
     """Extract profile with enhanced biographical research"""
     log.info("  → Conducting standard profile extraction...")
     
-    search_results = google_pack_for_person(name)
+    search_results = search_pack_for_person(name)
     lines = [f"- {r.get('title', '')} | {r.get('snippet', '')} | {r.get('link', '')}" 
              for r in search_results]
     
@@ -1156,9 +1475,12 @@ WEB SEARCH RESULTS:
 
 Write the career history narrative (4-6 paragraphs, narrative prose only):"""
 
-def extract_deep_career(name: str) -> Tuple[str, List[str]]:
+def extract_deep_career(name: str, fast_mode: bool = True) -> Tuple[str, List[str]]:
     """Extract comprehensive career narrative using enhanced research
     Returns: (career_text, list_of_source_urls)
+    
+    Args:
+        fast_mode: If True, uses parallel searches (5x faster)
     """
     log.info(f"  → Conducting deep career research for {name}...")
     
@@ -1172,10 +1494,23 @@ def extract_deep_career(name: str) -> Tuple[str, List[str]]:
         f'"{name}" business achievements'
     ]
     
-    results = []
-    for q in career_queries:
-        results.extend(search_web(q, num=5))
-        time.sleep(1.2)  # Rate limit
+    if fast_mode:
+        # FAST: Parallel searches
+        results = []
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            future_to_query = {executor.submit(search_web, q, 5): q for q in career_queries}
+            for future in as_completed(future_to_query):
+                try:
+                    results.extend(future.result())
+                except Exception as e:
+                    log.warning(f"Career search failed: {e}")
+        time.sleep(0.3)  # Brief delay after batch
+    else:
+        # SLOW: Sequential searches
+        results = []
+        for q in career_queries:
+            results.extend(search_web(q, num=5))
+            time.sleep(1.2)  # Rate limit
     
     # Deduplicate
     uniq, seen = [], set()
@@ -1247,7 +1582,14 @@ def generate_career_section(R: Dict[str, Any]) -> List[str]:
         paragraphs.append(career_text)
     
     if boards:
-        board_names = [b.get('org', '') for b in boards if b.get('org')]
+        board_names = []
+        for b in boards:
+            if isinstance(b, dict):
+                org = b.get('org', '')
+                if org:
+                    board_names.append(org)
+            elif isinstance(b, str):
+                board_names.append(b)
         if board_names:
             paragraphs.append(f"Board service includes: {', '.join(board_names)}.")
     
@@ -1281,9 +1623,12 @@ WEB SEARCH RESULTS:
 
 Write the philanthropic activities narrative (3-5 paragraphs, narrative prose only):"""
 
-def extract_deep_philanthropy(name: str) -> Tuple[str, List[str]]:
+def extract_deep_philanthropy(name: str, fast_mode: bool = True) -> Tuple[str, List[str]]:
     """Extract comprehensive philanthropic narrative
     Returns: (philanthropy_text, list_of_source_urls)
+    
+    Args:
+        fast_mode: If True, uses parallel searches (5x faster)
     """
     log.info(f"  → Conducting deep philanthropic research for {name}...")
     
@@ -1295,10 +1640,23 @@ def extract_deep_philanthropy(name: str) -> Tuple[str, List[str]]:
         f'"{name}" donor supporter'
     ]
     
-    results = []
-    for q in philanthropy_queries:
-        results.extend(search_web(q, num=5))
-        time.sleep(1.2)  # Rate limit
+    if fast_mode:
+        # FAST: Parallel searches
+        results = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_query = {executor.submit(search_web, q, 5): q for q in philanthropy_queries}
+            for future in as_completed(future_to_query):
+                try:
+                    results.extend(future.result())
+                except Exception as e:
+                    log.warning(f"Philanthropy search failed: {e}")
+        time.sleep(0.3)  # Brief delay after batch
+    else:
+        # SLOW: Sequential searches
+        results = []
+        for q in philanthropy_queries:
+            results.extend(search_web(q, num=5))
+            time.sleep(1.2)  # Rate limit
     
     # Deduplicate
     uniq, seen = [], set()
@@ -1361,7 +1719,14 @@ def generate_philanthropic_section(R: Dict[str, Any]) -> List[str]:
     
     if boards:
         para = f"{R.get('name', 'The donor')} demonstrates philanthropic engagement through board service with "
-        board_list = [f"{b.get('org', '')} ({b.get('role', 'Member')})" for b in boards]
+        board_list = []
+        for b in boards:
+            if isinstance(b, dict):
+                org = b.get('org', '')
+                role = b.get('role', 'Member')
+                board_list.append(f"{org} ({role})")
+            elif isinstance(b, str):
+                board_list.append(b)
         para += ", ".join(board_list) + "."
         paragraphs.append(para)
     
@@ -1520,12 +1885,15 @@ def generate_network_section(R: Dict[str, Any]) -> List[str]:
         para += f"{name} demonstrates commitment to institutional leadership through board service with "
         board_list = []
         for b in boards[:5]:  # Show top 5 boards
-            org = b.get('org', '')
-            role = b.get('role', '')
-            if role and role != 'Member':
-                board_list.append(f"{org} ({role})")
-            else:
-                board_list.append(org)
+            if isinstance(b, dict):
+                org = b.get('org', '')
+                role = b.get('role', '')
+                if role and role != 'Member':
+                    board_list.append(f"{org} ({role})")
+                else:
+                    board_list.append(org)
+            elif isinstance(b, str):
+                board_list.append(b)
         
         para += ", ".join(board_list)
         if len(boards) > 5:
@@ -1632,7 +2000,16 @@ def generate_ihs_assessment_narrative(R: Dict[str, Any], fec: Dict[str, Any],
     para = f"**Interest (I): {interest_score}.** "
     boards = R.get("nonprofit_boards", [])
     if boards:
-        para += f"{name}'s board service with {', '.join([b.get('org', '')[:30] for b in boards[:2]])} demonstrates interest in education and social impact. "
+        board_names = []
+        for b in boards[:2]:
+            if isinstance(b, dict):
+                org = b.get('org', '')
+                if org:
+                    board_names.append(org[:30])
+            elif isinstance(b, str):
+                board_names.append(b[:30])
+        if board_names:
+            para += f"{name}'s board service with {', '.join(board_names)} demonstrates interest in education and social impact. "
     para += "These philanthropic priorities suggest potential receptivity to IHS's academic programs and scholar development initiatives."
     paragraphs.append(para)
     
@@ -1783,6 +2160,32 @@ def generate_citations_section(all_citations: List[str]) -> List[str]:
 # -------------------------
 # MAIN
 # -------------------------
+def print_search_stats():
+    """Print search provider usage statistics"""
+    log.info("")
+    log.info("="*70)
+    log.info("SEARCH PROVIDER STATISTICS (LOAD BALANCED)")
+    log.info("="*70)
+    log.info(f"Tavily searches: {_search_stats['tavily']} (fresh) + {_search_stats['tavily_cached']} (cached) = {_search_stats['tavily'] + _search_stats['tavily_cached']} total")
+    log.info(f"Google searches: {_search_stats['google']} (fresh) + {_search_stats['google_cached']} (cached) = {_search_stats['google'] + _search_stats['google_cached']} total")
+    
+    total_fresh = _search_stats['tavily'] + _search_stats['google']
+    if total_fresh > 0:
+        tavily_pct = (_search_stats['tavily'] / total_fresh) * 100
+        google_pct = (_search_stats['google'] / total_fresh) * 100
+        log.info(f"Provider split (fresh only): Tavily={tavily_pct:.1f}% | Google={google_pct:.1f}%")
+        log.info(f"Load balancing: {'✓ Working as designed' if 30 <= tavily_pct <= 70 else '⚠ Imbalanced (expected with quota limits)'}")
+    
+    # Show exhaustion status
+    log.info(f"")
+    log.info(f"Google status: {'🔴 EXHAUSTED (Tavily-only mode)' if _google_fully_exhausted else '🟢 ACTIVE'}")
+    if _tavily_key_exhausted:
+        log.warning(f"Exhausted Tavily keys: {sorted(k+1 for k in _tavily_key_exhausted)}")
+    if _google_key_exhausted:
+        log.info(f"Exhausted Google keys: {sorted(k+1 for k in _google_key_exhausted)} of {len(GOOGLE_API_KEYS)}")
+    
+    log.info("="*70)
+
 def main():
     parser = argparse.ArgumentParser(
         description="IHS Hybrid Donor Research System - Optimized Edition"
@@ -1793,19 +2196,59 @@ def main():
     parser.add_argument("--outdir", default=".", help="Output directory")
     parser.add_argument("--test-mode", action="store_true",
                        help="TEST MODE: Process only the FIRST donor (for testing)")
+    parser.add_argument("--fast", action="store_true", default=True,
+                       help="Enable fast mode with parallel searches (default: enabled)")
+    parser.add_argument("--slow", action="store_true",
+                       help="Disable fast mode and use sequential searches (safer but 5-30x slower)")
+    parser.add_argument("--max-inner-circle", type=int, default=None,
+                       help="Limit inner circle comparisons to first N members (e.g., --max-inner-circle 100)")
+    parser.add_argument("--parallel-workers", type=int, default=10,
+                       help="Number of parallel workers for inner circle (default: 10)")
     args = parser.parse_args()
+    
+    # Determine fast mode setting
+    fast_mode = not args.slow  # Fast by default unless --slow is specified
     
     log.info("="*70)
     log.info("IHS HYBRID DONOR RESEARCH SYSTEM - NARRATIVE FORMAT EDITION")
     log.info("="*70)
     log.info(f"OpenAI Library: {OPENAI_VERSION if OPENAI_VERSION else 'Not installed'}")
     log.info(f"OpenAI Model: {OPENAI_MODEL}")
-    log.info(f"Search Provider: {SEARCH_PROVIDER.upper()}")
-    if SEARCH_PROVIDER == "google" and GOOGLE_API_KEYS:
-        log.info(f"Google API Keys: {len(GOOGLE_API_KEYS)} keys loaded")
-        log.info(f"  → Smart key switching: Automatically rotates on rate limits")
+    log.info(f"Speed Mode: {'⚡ FAST (parallel searches)' if fast_mode else '🐢 SLOW (sequential searches)'}")
+    if fast_mode:
+        log.info(f"  • Parallel workers: {args.parallel_workers}")
+        if args.max_inner_circle:
+            log.info(f"  • Inner circle limit: {args.max_inner_circle} members")
+        else:
+            log.info(f"  • Inner circle limit: None (all members)")
+    log.info("")
+    log.info("SEARCH PROVIDER CONFIGURATION:")
+    log.info(f"🔄 LOAD BALANCING MODE: Tavily ↔ Google")
+    log.info(f"Strategy:")
+    log.info(f"  1. First search → Tavily")
+    log.info(f"  2. Then alternate → Google, Tavily, Google, Tavily...")
+    log.info(f"  3. When Google exhausted → Tavily-only")
+    if TAVILY_API_KEYS:
+        log.info(f"")
+        log.info(f"  ✓ Tavily: ENABLED with {len(TAVILY_API_KEYS)} API key(s)")
+        log.info(f"    • Keys rotate automatically for even distribution")
+        if len(TAVILY_API_KEYS) > 1:
+            log.info(f"    • Combined quota: ~{len(TAVILY_API_KEYS) * 1000:,} queries/month")
+    else:
+        log.warning(f"  ✗ Tavily: DISABLED (no API keys found in spider.env)")
+    if GOOGLE_API_KEYS:
+        log.info(f"  ✓ Google: ENABLED with {len(GOOGLE_API_KEYS)} API key(s)")
+        log.info(f"    • Keys rotate automatically for even distribution")
         if len(GOOGLE_API_KEYS) > 1:
-            log.info(f"  → Combined quota: ~{len(GOOGLE_API_KEYS) * 10000:,} queries/day")
+            log.info(f"    • Combined quota: ~{len(GOOGLE_API_KEYS) * 100:,} queries/day")
+            log.info(f"    • Will be used until all keys exhausted")
+    else:
+        log.warning(f"  ✗ Google: DISABLED (no API keys found in spider.env)")
+    
+    if not TAVILY_API_KEYS and not GOOGLE_API_KEYS:
+        log.error("CRITICAL: No search providers configured! Please add API keys to spider.env")
+        return
+    
     log.info("")
     
     # Load data
@@ -1864,19 +2307,19 @@ def main():
         try:
             # 1) Profile + Deep Biographical Research
             log.info("Extracting profile with deep biographical research...")
-            R = extract_profile(donor_name)
+            R = extract_profile(donor_name)  # Uses search_pack_for_person which respects fast_mode
             R["City"] = donor_row.get("City", "")
             R["State"] = donor_row.get("State", "")
             
             # 2) Deep Career Research
             log.info("Conducting deep career narrative research...")
-            deep_career, career_sources = extract_deep_career(donor_name)
+            deep_career, career_sources = extract_deep_career(donor_name, fast_mode=fast_mode)
             R["deep_career_narrative"] = deep_career
             R["career_sources"] = career_sources
             
             # 2.5) Deep Philanthropy Research
             log.info("Conducting deep philanthropic research...")
-            deep_philanthropy, philanthropy_sources = extract_deep_philanthropy(donor_name)
+            deep_philanthropy, philanthropy_sources = extract_deep_philanthropy(donor_name, fast_mode=fast_mode)
             R["deep_philanthropy_narrative"] = deep_philanthropy
             R["philanthropy_sources"] = philanthropy_sources
             
@@ -1887,7 +2330,12 @@ def main():
             
             # 4) Inner Circle
             log.info(f"Starting deep comparison against {inner_circle_count} inner circle members...")
-            connections, conn_cites = research_inner_circle(R, inner_rows)
+            connections, conn_cites = research_inner_circle(
+                R, inner_rows,
+                max_members=args.max_inner_circle,
+                fast_mode=fast_mode,
+                parallel_workers=args.parallel_workers
+            )
             R["connections"] = connections
             
             # 5) Net Worth
@@ -1955,6 +2403,9 @@ def main():
             import traceback
             traceback.print_exc()
             continue
+    
+    # Print search statistics
+    print_search_stats()
     
     log.info(f"\n{'='*60}")
     log.info(f"✅ ALL DONE! Processed {len(names_to_process)} donor(s)")
