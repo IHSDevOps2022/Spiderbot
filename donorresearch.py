@@ -848,10 +848,17 @@ def verify_identity(name: str, csv_data: Dict[str, Any] = None) -> Dict[str, Any
         
         # Check for additional location fields in CSV (Previous City, Previous State, etc.)
         for key in csv_data.keys():
+            # Skip internal fields that start with underscore (these are lists)
+            if key.startswith('_'):
+                continue
             key_lower = key.lower()
             if 'city' in key_lower or 'location' in key_lower or 'address' in key_lower:
                 if key not in ['City', 'city'] and csv_data.get(key):
-                    loc = csv_data[key].strip()
+                    val = csv_data[key]
+                    # Skip if it's a list (internal data structure)
+                    if isinstance(val, list):
+                        continue
+                    loc = str(val).strip()
                     if loc and loc not in all_locations:
                         all_locations.append(loc)
         
@@ -991,9 +998,16 @@ def verify_identity(name: str, csv_data: Dict[str, Any] = None) -> Dict[str, Any
         if not loc_bonus:  # If primary location didn't match, try others
             combined_text = f"{title} {snippet}".lower()
             for key in csv_data.keys():
+                # Skip internal fields that start with underscore (these are lists)
+                if key.startswith('_'):
+                    continue
                 key_lower = key.lower()
                 if ('city' in key_lower or 'location' in key_lower) and key not in ['City', 'city']:
-                    other_loc = csv_data.get(key, "").strip()
+                    other_val = csv_data.get(key, "")
+                    # Skip if it's a list (internal data structure)
+                    if isinstance(other_val, list):
+                        continue
+                    other_loc = str(other_val).strip()
                     if other_loc and other_loc.lower() in combined_text:
                         loc_bonus = 0.15  # Slightly lower bonus for historical location
                         log.debug(f"  ✅ Historical location match: {other_loc}")
@@ -1724,33 +1738,35 @@ Return assessment with clear sections and bullet points:"""
 
 STRATEGIC_SUMMARY_PROMPT = """You are preparing a board-level strategic briefing about a donor prospect.
 
-Write a 3-paragraph executive summary for IHS board members covering:
+🚨 ABSOLUTE RULE - NO FABRICATION 🚨
+- ONLY include information that appears in the RESEARCH SUMMARY below
+- If the research says "Limited information available" or "No public records" - SAY THAT
+- NEVER invent job titles, companies, awards, accomplishments, or any details
+- NEVER fabricate citations - only cite information actually in the research
+- If research is sparse, write a SHORTER summary acknowledging the limitations
+- It is BETTER to say "limited information available" than to make something up
 
-Paragraph 1: **Who They Are**
-- CURRENT role, expertise, influence (prioritize most recent position)
-- Key accomplishments and recognition
-- Why they matter in their field
+Write an executive summary for IHS board members. If research is limited, acknowledge this honestly.
 
-🔴 CRITICAL: FOCUS ON CURRENT INFORMATION 🔴
-- Describe them by their CURRENT role, not past roles
-- Look for temporal indicators in the research summary:
-  * Current: "currently", "now serves", "current role", "serves as"
-  * Past: "formerly", "previously", "was", "former"
-- Lead with current position: "Jim Ronyak is the Managing Director for IT at IHS" 
-  NOT "Jim Ronyak is the Sr. Director at Mercatus" (if that was a past position)
+Paragraph 1: **Who They Are** (ONLY from research)
+- CURRENT role IF KNOWN from research (do not invent)
+- Key facts ONLY if documented in research
+- If research shows limited career info, say "Limited professional information available"
 
-Paragraph 2: **Why IHS Should Engage**
-- Alignment with liberty, free markets, academic freedom
-- Giving capacity and philanthropic track record
-- Strategic value (networks, influence, expertise)
+Paragraph 2: **Why IHS Should Engage** (ONLY if evidence exists)
+- Any alignment with liberty, free markets found in research
+- Giving capacity ONLY if documented
+- If no philanthropic record exists, acknowledge this
 
-Paragraph 3: **Cultivation Strategy**
-- Recommended approach and timeline
-- Potential gift range and program fit
-- Key staff or board members to involve
+Paragraph 3: **Cultivation Strategy** (based on available information)
+- Recommended approach given what IS known
+- Be conservative on gift estimates if capacity is unknown
+- Acknowledge if more research is needed
 
-CRITICAL: Include citation numbers [1], [2], etc. after factual claims.
-Write in professional, confident prose suitable for board review.
+CRITICAL: 
+- Citation numbers [1], [2], etc. MUST reference actual sources from the research
+- Do NOT invent fake citations like "Company Website" or "Industry Publications"
+- If you cannot cite something from the research, do NOT include the claim
 
 PROSPECT: {name}
 LOCATION: {location}
@@ -1762,47 +1778,49 @@ RESEARCH SUMMARY:
 {political_summary}
 {network_summary}
 
-Return 3-paragraph board briefing:"""
+Return summary (shorter if research is limited):"""
 
-GIFT_OFFICER_SUMMARY_PROMPT = """You are a gift officer preparing a 2-page executive summary for frontline fundraisers.
+GIFT_OFFICER_SUMMARY_PROMPT = """You are a gift officer preparing an executive summary for frontline fundraisers.
 
-Create a concise, action-oriented summary covering:
+🚨 ABSOLUTE RULE - NO FABRICATION 🚨
+- ONLY include information that appears in the RESEARCH SUMMARY below
+- If the research says "Limited information available" or "No public records" - SAY THAT
+- NEVER invent job titles, companies, awards, accomplishments, or any details
+- NEVER fabricate citations - only cite information actually in the research
+- If research is sparse, write a SHORTER summary acknowledging the limitations
+- It is BETTER to say "Information not available" than to make something up
 
 **RESEARCH CONFIDENCE: {confidence}**
 (Based on multi-marker verification: {marker_summary})
 
-1. **Quick Profile** (2-3 bullets)
-   - Who they are, CURRENT role/company (prioritize most recent position)
-   - Key credentials and expertise
-   - Geographic base
+1. **Quick Profile** (2-3 bullets - ONLY from research)
+   - Who they are, CURRENT role/company IF documented in research
+   - Key credentials IF found in research
+   - Geographic base (from research)
+   - If career info is limited, say "Professional background: Limited public information"
 
-🔴 CRITICAL: FOCUS ON CURRENT INFORMATION 🔴
-- When describing who they are, use their CURRENT position, not past positions
-- Look for temporal indicators in the research summary:
-  * Current: "currently", "now serves", "current role", "serves as"
-  * Past: "formerly", "previously", "was", "former"
-- Lead with current employment, mention past only if highly relevant
-- Example: "Managing Director for IT at IHS" NOT "Sr. Director at Mercatus" (if that was past)
+2. **Why They Matter to IHS** (ONLY if evidence exists)
+   - Alignment with IHS mission IF documented
+   - Giving capacity indicators IF documented
+   - If no alignment or capacity found, acknowledge this
 
-2. **Why They Matter to IHS** (3-4 bullets)
-   - Alignment with IHS mission (individual liberty, free markets, civil society)
-   - Demonstrated interest in related causes
-   - Giving capacity indicators
-   - Likelihood of engagement
+3. **Connection Points** (based on available information)
+   - How to reach them IF documented
+   - Topics that would interest them IF we have data
+   - If connections unknown, say so
 
-3. **Connection Points** (2-3 bullets)
-   - How to reach them (conferences, networks, mutual connections)
-   - Topics/programs that would interest them
-   - Best approach strategy
-
-4. **Ask Strategy** (2-3 bullets)
+4. **Ask Strategy** (conservative if data is limited)
    - Suggested cultivation steps
-   - Potential gift range
-   - Timing considerations
+   - Be conservative on gift estimates if capacity unknown
+   - If research limited, recommend gathering more information first
 
 {collision_warning}
 
-CRITICAL: Include citation numbers [1], [2], etc. after factual claims.
+CRITICAL: 
+- Citation numbers [1], [2], etc. MUST reference actual sources from the research
+- Do NOT invent fake citations
+- If you cannot cite something, do NOT include the claim
+
 Format as bullet points starting with "• " under clear section headers.
 
 PROSPECT: {name}
@@ -1818,7 +1836,7 @@ RESEARCH SUMMARY:
 
 {political_summary}
 
-Return executive summary with section headers and bullet points:"""
+Return executive summary (shorter if research is limited):"""
 
 def format_snippets_with_citations(results: List[Dict[str, str]], person_name: str = "", 
                                    location: str = "") -> str:
@@ -2989,6 +3007,27 @@ def research_net_worth_capacity(name: str, entity_type: str, location_filter: st
         if spouse_name:
             queries.insert(0, f'"Mr. and Mrs. {spouse_name}" foundation assets')
             queries.insert(1, f'"Mr. and Mrs. {spouse_name}" donation')
+        
+        # Add location-specific property searches (multiple locations if known)
+        if city and state:
+            queries.append(f'"{name}" property {city} {state}')
+        
+        # Check for secondary/alternate locations in donor_row
+        if donor_row:
+            secondary_locations = []
+            for key in donor_row.keys():
+                key_lower = key.lower()
+                if any(x in key_lower for x in ['city2', 'secondary', 'previous', 'alternate', 'other']):
+                    if 'city' in key_lower or 'location' in key_lower:
+                        loc_val = donor_row.get(key, "").strip()
+                        if loc_val and (not city or loc_val.lower() != city.lower()):
+                            secondary_locations.append(loc_val)
+            
+            # Add secondary location queries
+            for sec_loc in secondary_locations[:2]:  # Limit to 2 extra locations
+                queries.append(f'"{name}" property {sec_loc}')
+                queries.append(f'"{name}" foundation assets {sec_loc}')
+                log.info(f"  📍 Adding secondary location for wealth search: {sec_loc}")
     
     # Get web research results
     web_results = extract_bullet_section(name, entity_type, queries, BULLET_NETWORTH_PROMPT,
@@ -3576,6 +3615,20 @@ def detect_hallucinations(text: str, section_name: str) -> List[str]:
         (r"board member of.*advisory", "POSSIBLE HALLUCINATION: Generic advisory board - verify organization exists"),
         (r"board member of.*technology.*council", "POSSIBLE HALLUCINATION: Generic tech council - verify organization exists"),
         (r"affiliated with.*institute", "POSSIBLE HALLUCINATION: Vague institute affiliation - verify details"),
+        # NEW: Fabricated company/title patterns
+        (r"(CTO|CEO|CFO|COO|CIO|CMO)\s+(at|of)\s+\w+\s+(Solutions|Technologies|Tech|Innovations|Systems|Partners|Group|Consulting|Capital|Ventures|Holdings)", 
+         "LIKELY HALLUCINATION: Generic exec title at generic company name"),
+        (r"Chief\s+(Technology|Executive|Financial|Operating)\s+Officer\s+(at|of)\s+\w+\s+(Solutions|Technologies|Tech)", 
+         "LIKELY HALLUCINATION: C-suite at generic tech company"),
+        (r"(Innovator|Leader|Pioneer)\s+of\s+the\s+Year", "LIKELY HALLUCINATION: Generic award name"),
+        (r"(Tech|Technology|Business|Industry)\s+(Innovator|Leader)\s+of\s+the\s+Year", "LIKELY HALLUCINATION: Fabricated award"),
+        (r"thought leader in", "LIKELY HALLUCINATION: Vague 'thought leader' claim"),
+        (r"pivotal figure in", "LIKELY HALLUCINATION: Vague 'pivotal figure' claim"),
+        (r"spearheaded\s+(several|numerous|multiple)\s+(high-profile|major|significant)", "LIKELY HALLUCINATION: Generic accomplishment claim"),
+        (r"recognized\s+through\s+(various|numerous|multiple)\s+industry\s+awards", "LIKELY HALLUCINATION: Vague awards claim"),
+        (r"presents?\s+a\s+strategic\s+opportunity", "LIKELY HALLUCINATION: Speculative strategic language"),
+        (r"her\s+ability\s+to\s+drive\s+technological\s+advancements", "LIKELY HALLUCINATION: Generic capability claim"),
+        (r"making\s+(her|him|them)\s+a\s+pivotal\s+figure", "LIKELY HALLUCINATION: Inflated significance"),
     ]
     
     # Check for bullet points without citations (original check)
@@ -3608,10 +3661,33 @@ def detect_hallucinations(text: str, section_name: str) -> List[str]:
         r"(Global|International|National) [A-Z][a-z]+ (Society|Institute|Council)",
     ]
     
+    # NEW: Check for fabricated company names (common LLM hallucination patterns)
+    SUSPICIOUS_COMPANY_PATTERNS = [
+        r"\b\w+\s+(Solutions|Technologies|Tech|Innovations|Dynamics|Systems|Consulting)\s+(Inc|LLC|Corp|Corporation|Ltd)?\b",
+    ]
+    
     for pattern in SUSPICIOUS_ORG_PATTERNS:
         matches = re.findall(pattern, text)
         for match in matches:
             warnings.append(f"⚠️  {section_name}: Suspicious org name: '{match}' - verify this organization actually exists")
+    
+    for pattern in SUSPICIOUS_COMPANY_PATTERNS:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple):
+                match = ' '.join(match)
+            warnings.append(f"⚠️  {section_name}: Suspicious company name: '{match}' - verify this company exists and is related to the prospect")
+    
+    # NEW: Check for fake citation patterns (citing non-existent sources)
+    FAKE_CITATION_PATTERNS = [
+        r"\[1\]\s*Source:\s*(Company\s+Website|Industry\s+Publications|Awards?\s+Publications?)",
+        r"\[2\]\s*Source:\s*(Company\s+Website|Industry\s+Publications|Awards?\s+Publications?)",
+        r"\[3\]\s*Source:\s*(Company\s+Website|Strategy\s+Documents?|Internal\s+Documents?)",
+    ]
+    
+    for pattern in FAKE_CITATION_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            warnings.append(f"🚨 {section_name}: FABRICATED CITATION detected - GPT invented a fake source reference")
     
     return warnings
 
@@ -4011,6 +4087,171 @@ def find_donor_in_data(rows: List[Dict[str, Any]], name: str) -> Optional[Dict[s
     
     return None
 
+
+def generate_name_variations(donor_name: str, csv_data: Dict[str, Any], 
+                            alternate_names: List[Dict] = None) -> List[Dict[str, str]]:
+    """
+    Generate all name variations for comprehensive searching.
+    
+    Returns list of dicts with:
+    - name: The name variation
+    - type: maiden, previous_married, nickname, formal, etc.
+    - search_priority: high, medium, low
+    
+    Example: Patricia M Toft could have variations:
+    - Patricia M Toft (current)
+    - Pat Toft (nickname)
+    - Patricia Toft (no middle)
+    - Patricia M Brown (maiden - if detected)
+    - Patricia Brown (maiden no middle)
+    - Patricia M Long (previous married - if detected from marriage records)
+    """
+    variations = []
+    
+    # Parse current name
+    parts = donor_name.strip().split()
+    if len(parts) < 2:
+        return [{"name": donor_name, "type": "current", "search_priority": "high"}]
+    
+    first_name = parts[0]
+    last_name = parts[-1]
+    middle = " ".join(parts[1:-1]) if len(parts) > 2 else ""
+    middle_initial = middle[0] if middle else ""
+    
+    # Pre-compute nicknames (needed for maiden name variations below)
+    nicknames = NICKNAMES.get(first_name.lower(), set())
+    
+    # =====================================================
+    # PRIORITY ORDER: Maiden names FIRST (if available) since 
+    # older records often use maiden names for people who changed names
+    # =====================================================
+    
+    # 1. Maiden name variations FIRST (from alternate_names detected in CSV)
+    # These should be searched FIRST for older prospects who may have records under maiden name
+    if alternate_names:
+        for alt in alternate_names:
+            alt_last = alt.get("alternate_last_name", "")
+            if alt_last and alt_last.lower() != last_name.lower():
+                # Full maiden name with middle - HIGHEST PRIORITY for older records
+                if middle:
+                    variations.append({"name": f"{first_name} {middle} {alt_last}", "type": "maiden", "search_priority": "highest"})
+                if middle_initial:
+                    variations.append({"name": f"{first_name} {middle_initial} {alt_last}", "type": "maiden_initial", "search_priority": "highest"})
+                variations.append({"name": f"{first_name} {alt_last}", "type": "maiden_no_middle", "search_priority": "highest"})
+                
+                # Nicknames with maiden name
+                for nick in nicknames:
+                    nick_cap = nick.capitalize()
+                    variations.append({"name": f"{nick_cap} {alt_last}", "type": "nickname_maiden", "search_priority": "high"})
+    
+    # 2. Current name variations
+    variations.append({"name": donor_name, "type": "current", "search_priority": "high"})
+    variations.append({"name": f"{first_name} {last_name}", "type": "current_no_middle", "search_priority": "high"})
+    if middle_initial:
+        variations.append({"name": f"{first_name} {middle_initial} {last_name}", "type": "current_initial", "search_priority": "high"})
+    
+    # 3. Nickname variations (nicknames already computed above)
+    for nick in nicknames:
+        nick_cap = nick.capitalize()
+        variations.append({"name": f"{nick_cap} {last_name}", "type": "nickname", "search_priority": "medium"})
+        if middle_initial:
+            variations.append({"name": f"{nick_cap} {middle_initial} {last_name}", "type": "nickname_initial", "search_priority": "medium"})
+    
+    # Also check reverse - if first name is a nickname, add formal version
+    for formal, nicks in NICKNAMES.items():
+        if first_name.lower() in nicks:
+            formal_cap = formal.capitalize()
+            variations.append({"name": f"{formal_cap} {last_name}", "type": "formal_name", "search_priority": "medium"})
+    
+    # 4. Spouse name variations (for searching as couple)
+    spouse = csv_data.get("Spouse/Partner", csv_data.get("Spouse", "")).strip()
+    if spouse:
+        variations.append({"name": f"Mr. and Mrs. {spouse}", "type": "couple", "search_priority": "low"})
+        variations.append({"name": f"{donor_name} and {spouse}", "type": "couple_full", "search_priority": "low"})
+    
+    # Remove duplicates while preserving order and priority
+    seen = set()
+    unique_variations = []
+    for v in variations:
+        if v["name"].lower() not in seen:
+            seen.add(v["name"].lower())
+            unique_variations.append(v)
+    
+    return unique_variations
+
+
+def find_related_rows(rows: List[Dict[str, Any]], donor_row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Find related rows in the CSV that might contain:
+    - Maiden name (row with just last name, no first name, matching location pattern)
+    - Alternate names or aliases
+    - Spouse information
+    
+    Example from CSV:
+        Row 1: Patricia, M, Toft, Burlingame, CA  (main donor)
+        Row 2: ,,Brown,,bainbridge island,wa      (potential maiden name - no first name)
+    
+    Returns list of related rows with metadata about the relationship type.
+    """
+    related = []
+    
+    # Get donor's info for comparison
+    donor_name = get_row_name(donor_row)
+    donor_first = donor_row.get("First Name", donor_row.get("First", "")).strip()
+    donor_last = donor_row.get("Last Name", donor_row.get("Last", "")).strip()
+    donor_city = donor_row.get("City", "").strip().lower()
+    donor_state = donor_row.get("State", "").strip().lower()
+    
+    for row in rows:
+        if row == donor_row:
+            continue
+        
+        row_first = row.get("First Name", row.get("First", "")).strip()
+        row_middle = row.get("Middle Name", row.get("Middle", "")).strip()
+        row_last = row.get("Last Name", row.get("Last", "")).strip()
+        row_city = row.get("City", "").strip().lower()
+        row_state = row.get("State", "").strip().lower()
+        
+        # Pattern 1: Row has ONLY last name (no first name) - could be maiden name or alternate name
+        # Example: ",,Brown,,bainbridge island,wa"
+        if row_last and not row_first:
+            # This could be a maiden name or alternate surname
+            related.append({
+                "row": row,
+                "type": "alternate_name",
+                "alternate_last_name": row_last,
+                "associated_location": f"{row_city}, {row_state}".strip(", ") if row_city or row_state else None,
+                "confidence": "medium" if (row_city or row_state) else "low"
+            })
+            log.info(f"  🔗 Found potential alternate name row: Last='{row_last}', Location='{row_city}, {row_state}'")
+        
+        # Pattern 2: Row has same last name but different first name at same location - could be spouse
+        elif row_last.lower() == donor_last.lower() and row_first and row_first.lower() != donor_first.lower():
+            if (row_city and row_city == donor_city) or (row_state and row_state == donor_state):
+                related.append({
+                    "row": row,
+                    "type": "potential_spouse",
+                    "spouse_name": f"{row_first} {row_last}",
+                    "same_location": True,
+                    "confidence": "medium"
+                })
+                log.info(f"  🔗 Found potential spouse row: {row_first} {row_last}")
+        
+        # Pattern 3: Row shares location with donor but different last name - could be maiden name connection
+        elif row_city and row_state and row_city == donor_city and row_state == donor_state:
+            if row_last and row_last.lower() != donor_last.lower():
+                if not row_first:  # No first name suggests it's a reference/alternate name
+                    related.append({
+                        "row": row,
+                        "type": "same_location_alternate",
+                        "alternate_last_name": row_last,
+                        "shared_location": f"{row_city}, {row_state}",
+                        "confidence": "low"
+                    })
+    
+    return related
+
+
 def should_skip_inner_circle(donor_row: Dict[str, Any]) -> bool:
     """Check if Inner Circle analysis should be skipped based on CSV column"""
     already_known = donor_row.get("Already known", "").strip().lower()
@@ -4020,6 +4261,199 @@ def should_skip_inner_circle(donor_row: Dict[str, Any]) -> bool:
         log.info("  ⏭️  Skipping Inner Circle analysis (Already known = Yes)")
     
     return skip
+
+
+def merge_person_rows(rows: List[Dict[str, Any]], primary_last_name: str) -> Dict[str, Any]:
+    """
+    Merge all rows that belong to the same person into one comprehensive record.
+    
+    This handles the case where multiple CSV rows represent different pieces of 
+    information about ONE person (different addresses, name variations, etc.)
+    
+    Args:
+        rows: All rows from the CSV
+        primary_last_name: The last name to match on (e.g., "Toft")
+    
+    Returns:
+        A merged record with:
+        - All name variations collected
+        - All addresses/properties collected
+        - Maiden name extracted
+        - DOB parsed
+        - Spouse info combined
+        - All emails/phones collected
+    """
+    merged = {
+        "First Name": "",
+        "Middle Name": "",
+        "Last Name": primary_last_name,
+        "Maiden Name": "",
+        "Nickname": "",
+        "DOB": "",
+        "Date of Birth": "",
+        "Spouse/Partner": "",
+        "Already known": "",
+        # Collected items
+        "_all_addresses": [],
+        "_all_name_variations": [],
+        "_all_emails": [],
+        "_all_phones": [],
+        "_all_cities": [],
+        "_all_states": [],
+    }
+    
+    matching_rows = []
+    for row in rows:
+        row_last = (row.get("Last Name", "") or row.get("Last", "")).strip()
+        # Match on last name (case-insensitive)
+        if row_last.lower() == primary_last_name.lower():
+            matching_rows.append(row)
+        # Also include rows with NO last name but have an address (property-only rows)
+        elif not row_last and row.get("Address", "").strip():
+            matching_rows.append(row)
+    
+    log.info(f"  📋 Merging {len(matching_rows)} rows for '{primary_last_name}'")
+    
+    for row in matching_rows:
+        # Collect primary fields (first non-empty wins)
+        if not merged["First Name"]:
+            first = (row.get("First Name", "") or row.get("First", "")).strip()
+            # Skip if it's just initials like "PM" or "M"
+            if first and len(first) > 2:
+                merged["First Name"] = first
+        
+        if not merged["Middle Name"]:
+            middle = (row.get("Middle Name", "") or row.get("Middle", "")).strip()
+            if middle:
+                merged["Middle Name"] = middle
+        
+        if not merged["Maiden Name"]:
+            maiden = row.get("Maiden Name", "").strip()
+            if maiden:
+                merged["Maiden Name"] = maiden
+                log.info(f"    📛 Found Maiden Name: {maiden}")
+        
+        if not merged["Nickname"]:
+            nick = row.get("Nickname", "").strip()
+            if nick:
+                merged["Nickname"] = nick
+                log.info(f"    📛 Found Nickname: {nick}")
+        
+        if not merged["DOB"] and not merged["Date of Birth"]:
+            dob = row.get("DOB", row.get("Date of Birth", "")).strip()
+            if dob:
+                merged["DOB"] = dob
+                merged["Date of Birth"] = dob
+                log.info(f"    🎂 Found DOB: {dob}")
+        
+        if not merged["Spouse/Partner"]:
+            spouse = row.get("Spouse/Partner", row.get("Spouse", "")).strip()
+            if spouse:
+                merged["Spouse/Partner"] = spouse
+                log.info(f"    💑 Found Spouse: {spouse}")
+        
+        if not merged["Already known"]:
+            known = row.get("Already known", "").strip()
+            if known:
+                merged["Already known"] = known
+        
+        # Collect address as a property
+        address = row.get("Address", "").strip()
+        city = row.get("City", "").strip()
+        state = row.get("State", "").strip()
+        zip_code = row.get("Zip", "").strip()
+        
+        if address or city:
+            addr_entry = {
+                "address": address,
+                "city": city,
+                "state": state,
+                "zip": zip_code,
+                "full": f"{address}, {city}, {state} {zip_code}".strip(", ")
+            }
+            # Avoid duplicates
+            if addr_entry["full"] not in [a["full"] for a in merged["_all_addresses"]]:
+                merged["_all_addresses"].append(addr_entry)
+                log.info(f"    🏠 Found address: {addr_entry['full']}")
+        
+        # Collect cities/states for location searches
+        if city and city.lower() not in [c.lower() for c in merged["_all_cities"]]:
+            merged["_all_cities"].append(city)
+        if state and state.upper() not in [s.upper() for s in merged["_all_states"]]:
+            merged["_all_states"].append(state)
+        
+        # Collect name variations
+        first = (row.get("First Name", "") or row.get("First", "")).strip()
+        last = (row.get("Last Name", "") or row.get("Last", "")).strip()
+        if first and last:
+            name_var = f"{first} {last}"
+            if name_var not in merged["_all_name_variations"]:
+                merged["_all_name_variations"].append(name_var)
+        elif first:  # Just first name (like "PM")
+            if first not in merged["_all_name_variations"]:
+                merged["_all_name_variations"].append(first)
+        
+        # Collect emails
+        for email_field in ["Work Email", "Email", "Personal Email", "Spouse/Partner Contact Email"]:
+            email = row.get(email_field, "").strip()
+            if email and email not in merged["_all_emails"]:
+                merged["_all_emails"].append(email)
+        
+        # Collect phones
+        for phone_field in ["Work Phone", "Phone", "Mobile", "Spouse/Partner Contact Phone"]:
+            phone = row.get(phone_field, "").strip()
+            if phone and phone not in merged["_all_phones"]:
+                merged["_all_phones"].append(phone)
+    
+    # Set primary City/State from first address with both
+    for addr in merged["_all_addresses"]:
+        if addr["city"] and addr["state"]:
+            if not merged.get("City"):
+                merged["City"] = addr["city"]
+                merged["State"] = addr["state"]
+                merged["Zip"] = addr["zip"]
+                merged["Address"] = addr["address"]
+                break
+    
+    # Log summary
+    log.info(f"    📊 Merged result: {len(merged['_all_addresses'])} addresses, "
+             f"{len(merged['_all_cities'])} cities, {len(merged['_all_name_variations'])} name variations")
+    
+    return merged
+
+
+def parse_dob_year(dob_str: str) -> Optional[int]:
+    """
+    Parse DOB string in various formats and return birth year.
+    
+    Handles:
+    - "Aug-36" -> 1936
+    - "1936" -> 1936
+    - "08/15/1936" -> 1936
+    - "August 1936" -> 1936
+    """
+    if not dob_str:
+        return None
+    
+    import re
+    
+    # Try to find a 4-digit year first
+    match = re.search(r'\b(19\d{2}|20\d{2})\b', str(dob_str))
+    if match:
+        return int(match.group(1))
+    
+    # Try 2-digit year format like "Aug-36"
+    match = re.search(r'(\d{2})$', str(dob_str).strip())
+    if match:
+        year_2digit = int(match.group(1))
+        # Assume 1900s for 2-digit years > 25, 2000s for <= 25
+        if year_2digit > 25:
+            return 1900 + year_2digit
+        else:
+            return 2000 + year_2digit
+    
+    return None
+
 
 def search_large_csv_streaming(name_variants: List[str], csv_path: str, max_rows: int = 500000) -> Optional[Dict[str, Any]]:
     """
@@ -5077,6 +5511,75 @@ def main():
             log.warning(f"Skipping: '{donor_name}' not found in {args.data}")
             continue
         
+        # =====================================================
+        # NEW: MERGE ALL ROWS for the same person
+        # If multiple rows share the same last name, they likely 
+        # represent different pieces of info about ONE person
+        # =====================================================
+        donor_last = (donor_row.get("Last Name", "") or donor_row.get("Last", "")).strip()
+        if donor_last:
+            # Count how many rows share this last name
+            same_last_count = sum(1 for r in data_rows 
+                                  if (r.get("Last Name", "") or r.get("Last", "")).strip().lower() == donor_last.lower()
+                                  or not (r.get("Last Name", "") or r.get("Last", "")).strip())  # Include no-name rows (properties)
+            
+            if same_last_count > 1:
+                log.info(f"  🔀 MERGING {same_last_count} rows with last name '{donor_last}' into single record")
+                merged_row = merge_person_rows(data_rows, donor_last)
+                
+                # Use merged data instead of single row
+                donor_row = merged_row
+                
+                # Update donor_name to use full name from merged data
+                merged_first = merged_row.get("First Name", "").strip()
+                merged_middle = merged_row.get("Middle Name", "").strip()
+                if merged_first:
+                    if merged_middle:
+                        donor_name = f"{merged_first} {merged_middle} {donor_last}"
+                    else:
+                        donor_name = f"{merged_first} {donor_last}"
+                    log.info(f"  📝 Using merged name: {donor_name}")
+        
+        # NEW: Find related rows that might contain alternate names, maiden names, etc.
+        related_rows = find_related_rows(data_rows, donor_row)
+        alternate_names = []
+        
+        # FIRST: Check for Maiden Name column directly in the CSV
+        maiden_name_col = donor_row.get("Maiden Name", "").strip()
+        if maiden_name_col:
+            first_name = donor_row.get("First Name", "").strip()
+            middle_name = donor_row.get("Middle Name", "").strip()
+            if first_name:
+                if middle_name:
+                    alt_name = f"{first_name} {middle_name} {maiden_name_col}"
+                else:
+                    alt_name = f"{first_name} {maiden_name_col}"
+                alternate_names.append({
+                    "name": alt_name,
+                    "alternate_last_name": maiden_name_col,
+                    "location": "",
+                    "type": "maiden_name_column"
+                })
+                log.info(f"  📛 MAIDEN NAME from CSV column: {alt_name}")
+        
+        if related_rows:
+            log.info(f"  🔍 Found {len(related_rows)} potentially related rows in CSV")
+            for rel in related_rows:
+                if rel["type"] == "alternate_name" and rel.get("alternate_last_name"):
+                    # Build alternate name using donor's first name + alternate last name
+                    alt_first = donor_row.get("First Name", donor_row.get("First", "")).strip()
+                    alt_last = rel["alternate_last_name"]
+                    if alt_first and alt_last:
+                        alt_name = f"{alt_first} {alt_last}"
+                        alternate_names.append({
+                            "name": alt_name,
+                            "location": rel.get("associated_location", ""),
+                            "type": "maiden_or_alternate"
+                        })
+                        log.info(f"    📛 Alternate name detected: {alt_name} (associated with: {rel.get('associated_location', 'unknown location')})")
+                elif rel["type"] == "potential_spouse":
+                    log.info(f"    💑 Potential spouse detected: {rel.get('spouse_name', '')}")
+        
         try:
             # 1) Identity Verification - using ALL CSV data (with contactsdb.csv enrichment)
             log.info(f"📊 Extracting CSV data for {donor_name}...")
@@ -5091,6 +5594,26 @@ def main():
                 log.info(f"  Available data: {', '.join(data_summary.keys())}")
             else:
                 log.warning(f"  ⚠️  Only name found in CSV - no additional context data")
+            
+            # NEW: Check age to determine if prospect is likely retired
+            is_retired_age = False
+            dob_str = csv_data.get("Date of Birth", csv_data.get("DOB", csv_data.get("Birth Date", "")))
+            birth_year = None
+            if dob_str:
+                # Use enhanced parser that handles "Aug-36" format
+                birth_year = parse_dob_year(dob_str)
+                if birth_year:
+                    current_year = datetime.now().year
+                    age = current_year - birth_year
+                    if age >= 75:
+                        is_retired_age = True
+                        log.info(f"  👴 RETIRED INDICATOR: Birth year {birth_year} (age ~{age}) - prioritizing retired/former searches")
+                else:
+                    log.debug(f"  Could not parse DOB: {dob_str}")
+            
+            # Store in csv_data for use in research functions
+            csv_data['_is_retired_age'] = is_retired_age
+            csv_data['_birth_year'] = birth_year
             
             # Pass ALL CSV data (potentially enriched from contactsdb.csv) to identity verification
             identity = verify_identity(donor_name, csv_data)
@@ -5122,6 +5645,21 @@ def main():
             state = csv_data.get("State", "")
             location_filter = f"{city}, {state}" if city and state else city if city else state if state else ""
             
+            # NEW: Add all merged addresses/locations to csv_data for comprehensive searching
+            if "_all_addresses" in csv_data:
+                log.info(f"  🏠 Using {len(csv_data['_all_addresses'])} addresses from merged data")
+                for i, addr in enumerate(csv_data["_all_addresses"]):
+                    log.info(f"      Address {i+1}: {addr['full']}")
+            
+            if "_all_cities" in csv_data and len(csv_data["_all_cities"]) > 1:
+                log.info(f"  📍 Multiple cities: {', '.join(csv_data['_all_cities'])}")
+                # Add secondary cities for search queries
+                for i, other_city in enumerate(csv_data["_all_cities"][1:], 2):
+                    csv_data[f"Secondary City {i}"] = other_city
+            
+            if "_all_states" in csv_data and len(csv_data["_all_states"]) > 1:
+                log.info(f"  📍 Multiple states: {', '.join(csv_data['_all_states'])}")
+            
             # CRITICAL: Extract spouse name for filtering ALL web searches
             # This prevents mixing data from wrong people with same name
             spouse_name = ""
@@ -5148,10 +5686,20 @@ def main():
                 partner = get_spouse_from_row(csv_data)
                 if partner:
                     parts = partner.split()
-                    if len(parts) >= 2:
-                        spouse_name = f"{parts[0]} {parts[-1]}"
+                    if len(parts) >= 1:
+                        # Handle single name spouse (like "James F Long")
+                        spouse_name = partner.strip()
                         log.info(f"  💑 SPOUSE DETECTED: {spouse_name} (from Spouse/Partner column)")
                         log.info(f"     ALL web search results will be filtered to require spouse mention!")
+            
+            # GENERATE ALL NAME VARIATIONS for comprehensive searching
+            name_variations = generate_name_variations(donor_name, csv_data, alternate_names)
+            if name_variations:
+                log.info(f"  📛 Generated {len(name_variations)} name variations for searching:")
+                for var in name_variations[:8]:  # Show first 8
+                    log.info(f"      - {var['name']} ({var['type']})")
+                if len(name_variations) > 8:
+                    log.info(f"      ... and {len(name_variations) - 8} more")
             
             # 2) Biographical Research (bullet points)
             # Use ALL CSV data to guide research (employer, title, education, location, etc.)
@@ -5178,16 +5726,79 @@ def main():
                 # Build targeted biographical queries using ALL available CSV data
                 bio_queries = []
                 
-                # Core biographical queries
+                # NEW: Get retired age flag
+                is_retired = csv_data.get('_is_retired_age', False)
+                
+                # =====================================================
+                # PRIORITY 0: RETIRED/FORMER searches (if 75+ years old)
+                # =====================================================
+                if is_retired:
+                    log.info(f"  👴 Prospect is 75+ - prioritizing retired/former searches")
+                    bio_queries.extend([
+                        f'"{donor_name}" retired former professional',
+                        f'"{donor_name}" retired {city}' if city else None,
+                        f'"{donor_name}" career history',
+                    ])
+                    # Add employer with retired context
+                    if employer:
+                        bio_queries.extend([
+                            f'"{donor_name}" retired "{employer}"',
+                            f'"{donor_name}" former "{employer}"',
+                        ])
+                        log.info(f"  👴 Adding retired+employer: {employer}")
+                
+                # =====================================================
+                # PRIORITY 1: MOST SPECIFIC - Name AND Employer AND Title
+                # This is the BEST query for pinpointing the exact person!
+                # =====================================================
+                if employer and title:
+                    # BEST QUERY: All three components together
+                    bio_queries.insert(0, f'"{donor_name}" "{employer}" "{title}"')
+                    bio_queries.insert(1, f'"{donor_name}" {employer} {title}')
+                    # Add with location for even more specificity
+                    if city:
+                        bio_queries.insert(2, f'"{donor_name}" "{employer}" "{title}" {city}')
+                    log.info(f"  🏢💼 PRIORITY QUERY: \"{donor_name}\" \"{employer}\" \"{title}\"")
+                    
+                    # For retired prospects, also search past tense
+                    if is_retired:
+                        bio_queries.extend([
+                            f'"{donor_name}" former "{title}" "{employer}"',
+                            f'"{donor_name}" retired "{title}"',
+                        ])
+                
+                # =====================================================
+                # PRIORITY 2: Name AND Employer (without title)
+                # =====================================================
+                elif employer:
+                    bio_queries.extend([
+                        f'"{donor_name}" "{employer}"',
+                        f'"{donor_name}" {employer}',
+                    ])
+                    if city:
+                        bio_queries.append(f'"{donor_name}" "{employer}" {city}')
+                    log.info(f"  🏢 Including employer in bio queries: {employer}")
+                
+                # =====================================================
+                # PRIORITY 3: Name AND Title (without employer)
+                # =====================================================
+                elif title:
+                    bio_queries.extend([
+                        f'"{donor_name}" "{title}"',
+                        f'"{donor_name}" {title}',
+                    ])
+                    if city:
+                        bio_queries.append(f'"{donor_name}" "{title}" {city}')
+                    log.info(f"  💼 Including title in bio queries: {title}")
+                
+                # Remove None entries from retired queries
+                bio_queries = [q for q in bio_queries if q]
+                
+                # Core biographical queries (lower priority - employer/title already handled above)
                 bio_queries.extend([
                     f'"{donor_name}" biography',
                     f'"{donor_name}" education background',
                 ])
-                
-                # Add employer-specific queries if available
-                if employer:
-                    bio_queries.append(f'"{donor_name}" {employer} biography')
-                    log.info(f"  🏢 Including employer in bio queries: {employer}")
                 
                 # Add education-specific queries if available
                 if education:
@@ -5206,9 +5817,206 @@ def main():
                     if location_filter:
                         bio_queries.append(f'"{donor_name}" "{spouse_name}" {location_filter}')
                 
-                # Add location-specific queries if available
+                # SPOUSE DISCOVERY: If no spouse in CSV, search for spouse info
+                if not spouse_name:
+                    bio_queries.extend([
+                        f'"{donor_name}" husband wife married',
+                        f'"{donor_name}" spouse partner',
+                    ])
+                    if location_filter:
+                        bio_queries.append(f'"{donor_name}" {location_filter} husband OR wife OR married')
+                    log.info(f"  💍 Adding spouse discovery queries (no spouse in CSV)")
+                
+                # MUNICIPAL/CIVIC RECORD SEARCHES - find board memberships, civic activities
+                if city:
+                    bio_queries.extend([
+                        f'"{donor_name}" {city} board trustee commission',
+                        f'"{donor_name}" {city} library OR council OR planning',
+                        f'"{donor_name}" {city} volunteer civic',
+                    ])
+                    log.info(f"  🏛️ Adding municipal record queries for: {city}")
+                
+                # =====================================================
+                # MULTIPLE LOCATION SUPPORT - Search all known locations
+                # =====================================================
+                # Primary location
                 if location_filter:
                     bio_queries.append(f'"{donor_name}" {location_filter} biography')
+                
+                # Secondary/alternate locations (from CSV or merged data)
+                secondary_locations = []
+                
+                # FIRST: Use merged _all_cities if available (from merge_person_rows)
+                all_cities = csv_data.get("_all_cities", [])
+                if all_cities and len(all_cities) > 1:
+                    # Add all cities except the primary one
+                    for other_city in all_cities:
+                        if city and other_city.lower() != city.lower():
+                            if other_city not in secondary_locations:
+                                secondary_locations.append(other_city)
+                
+                # ALSO: Check for secondary location fields (traditional approach)
+                for key in csv_data.keys():
+                    # Skip internal fields that start with underscore
+                    if key.startswith('_'):
+                        continue
+                    key_lower = key.lower()
+                    if any(x in key_lower for x in ['city2', 'secondary', 'previous', 'alternate', 'other']):
+                        if 'city' in key_lower or 'location' in key_lower:
+                            loc_val = csv_data.get(key, "")
+                            # Skip if it's a list (internal data structure)
+                            if isinstance(loc_val, list):
+                                continue
+                            loc_str = str(loc_val).strip()
+                            if loc_str and city and loc_str.lower() != city.lower():
+                                if loc_str not in secondary_locations:
+                                    secondary_locations.append(loc_str)
+                
+                # Also check for spouse's location that differs from primary
+                if alternate_names:
+                    for alt in alternate_names:
+                        alt_loc = alt.get("location", alt.get("associated_location", ""))
+                        if alt_loc and alt_loc.lower() != location_filter.lower():
+                            if alt_loc not in secondary_locations:
+                                secondary_locations.append(alt_loc)
+                
+                # Search secondary locations
+                if secondary_locations:
+                    log.info(f"  📍 Adding searches for {len(secondary_locations)} secondary location(s): {', '.join(secondary_locations)}")
+                    for sec_loc in secondary_locations[:3]:  # Limit to 3
+                        bio_queries.extend([
+                            f'"{donor_name}" {sec_loc}',
+                            f'"{donor_name}" {sec_loc} property OR foundation',
+                        ])
+                
+                # =====================================================
+                # ALTERNATE NAME / MAIDEN NAME SEARCH (HIGH PRIORITY)
+                # These are critical for people who changed names!
+                # =====================================================
+                bio_queries.extend([
+                    f'"{donor_name}" maiden name "also known as"',
+                    f'"{donor_name}" "formerly known as" OR "née"',
+                ])
+                log.info(f"  📛 Adding alternate name discovery queries")
+                
+                # USE ALTERNATE NAMES FROM CSV (e.g., maiden name from related row)
+                # PRIORITY SEARCHES: Put maiden name queries at the TOP
+                if alternate_names:
+                    for alt in alternate_names:
+                        alt_name = alt.get("name", "")
+                        alt_location = alt.get("location", alt.get("associated_location", ""))
+                        alt_last = alt.get("alternate_last_name", "") if isinstance(alt, dict) else ""
+                        
+                        if alt_name:
+                            # =====================================================
+                            # PRIORITY: Maiden name + employer + title (BEST query)
+                            # =====================================================
+                            if employer and title:
+                                bio_queries.insert(0, f'"{alt_name}" "{employer}" "{title}"')
+                                log.info(f"  📛🏢 PRIORITY: Maiden name with employer: \"{alt_name}\" \"{employer}\" \"{title}\"")
+                            elif employer:
+                                bio_queries.insert(0, f'"{alt_name}" "{employer}"')
+                                log.info(f"  📛🏢 PRIORITY: Maiden name with employer: \"{alt_name}\" \"{employer}\"")
+                            
+                            # Standard maiden name searches
+                            bio_queries.extend([
+                                f'"{alt_name}" biography',
+                                f'"{alt_name}" married',
+                            ])
+                            
+                            # Search for connection between current and alternate name
+                            bio_queries.append(f'"{donor_name}" "{alt_name}"')
+                            
+                            if alt_location:
+                                bio_queries.append(f'"{alt_name}" {alt_location}')
+                            
+                            log.info(f"  📛 Adding queries for alternate name from CSV: {alt_name}")
+                            
+                            # MARRIAGE RECORD SEARCHES - search for maiden name in marriage records
+                            if alt_last:
+                                # Search for marriage records linking maiden name to current name
+                                donor_last = csv_data.get("Last Name", csv_data.get("Last", "")).strip()
+                                bio_queries.extend([
+                                    f'"{alt_name}" marriage record "{donor_last}"',
+                                    f'"{alt_name}" married "{donor_last}"',
+                                    # Also try California/state marriage records
+                                    f'"{alt_name}" {state} marriage' if state else None,
+                                ])
+                                bio_queries = [q for q in bio_queries if q]  # Remove None
+                                log.info(f"  💒 Adding marriage record searches: {alt_name} → {donor_last}")
+                
+                # PROFESSIONAL LICENSE SEARCHES - real estate, teaching, nursing, etc.
+                if state:
+                    bio_queries.extend([
+                        f'"{donor_name}" {state} real estate license',
+                        f'"{donor_name}" {state} professional license',
+                        f'"{donor_name}" {state} teaching credential',
+                    ])
+                    log.info(f"  📜 Adding professional license searches for {state}")
+                
+                # WORK HISTORY / EMPLOYER SEARCHES - search county/government employee records
+                if city or state:
+                    county_name = city.replace(" ", "") if city else ""
+                    bio_queries.extend([
+                        f'"{donor_name}" teacher tutor educator',
+                        f'"{donor_name}" county employee',
+                    ])
+                    if city:
+                        bio_queries.append(f'"{donor_name}" "{city} County" OR "{city}"')
+                    log.info(f"  👔 Adding work history / employer searches")
+                
+                # PROPERTY RECORDS - can indicate wealth and residence history
+                if city and state:
+                    bio_queries.append(f'"{donor_name}" property owner {city} {state}')
+                    log.info(f"  🏠 Adding property ownership search")
+                
+                # NAME VARIATION SEARCHES - use all generated variations
+                if name_variations:
+                    # Add highest-priority variations FIRST (maiden names)
+                    highest_priority_vars = [v for v in name_variations if v.get("search_priority") == "highest" and v["name"] != donor_name]
+                    for var in highest_priority_vars[:3]:  # Maiden names first
+                        var_name = var["name"]
+                        # Search maiden name with employer/title (BEST query for older records)
+                        if employer and title:
+                            bio_queries.insert(0, f'"{var_name}" "{employer}" "{title}"')
+                        elif employer:
+                            bio_queries.insert(0, f'"{var_name}" "{employer}"')
+                        bio_queries.extend([
+                            f'"{var_name}" {location_filter}' if location_filter else f'"{var_name}"',
+                        ])
+                    if highest_priority_vars:
+                        log.info(f"  📛 Adding PRIORITY searches for {len(highest_priority_vars)} maiden name variations")
+                    
+                    # Add high-priority variations to search
+                    high_priority_vars = [v for v in name_variations if v.get("search_priority") == "high" and v["name"] != donor_name]
+                    for var in high_priority_vars[:5]:  # Limit to avoid too many queries
+                        var_name = var["name"]
+                        bio_queries.extend([
+                            f'"{var_name}" {location_filter}' if location_filter else f'"{var_name}"',
+                        ])
+                    if high_priority_vars:
+                        log.info(f"  📛 Adding searches for {len(high_priority_vars)} name variations")
+                    
+                    # Search for maiden/previous names with marriage records
+                    maiden_vars = [v for v in name_variations if v.get("type") in ("maiden", "maiden_initial", "maiden_no_middle")]
+                    for var in maiden_vars[:3]:
+                        var_name = var["name"]
+                        bio_queries.extend([
+                            f'"{var_name}" marriage',
+                            f'"{var_name}" "{csv_data.get("Last Name", csv_data.get("Last", "")).strip()}"',
+                        ])
+                    if maiden_vars:
+                        log.info(f"  💒 Adding marriage record searches for {len(maiden_vars)} maiden name variations")
+                
+                # PUBLIC RECORDS DATABASE SEARCHES
+                # Search for the person in public records (avoids blocked data broker sites)
+                bio_queries.extend([
+                    f'"{donor_name}" public records {state}' if state else f'"{donor_name}" public records',
+                    f'"{donor_name}" voter registration' if state else None,
+                    f'"{donor_name}" marriage divorce records {state}' if state else None,
+                ])
+                bio_queries = [q for q in bio_queries if q]  # Remove None entries
+                log.info(f"  📋 Adding public records searches")
                 
                 # Standard queries
                 bio_queries.extend([
@@ -5249,19 +6057,46 @@ def main():
                 # Build targeted career queries using employer/title from CSV
                 career_queries = []
                 
+                # Get retired age flag
+                is_retired = csv_data.get('_is_retired_age', False)
+                
                 # Add "Mr. and Mrs." variant if spouse is known (captures historical activities)
                 if spouse_name:
                     career_queries.append(f'"Mr. and Mrs. {spouse_name}"')
                     career_queries.append(f'"Mr and Mrs {spouse_name}"')
                 
-                # Add employer/title-specific queries if available
+                # =====================================================
+                # PRIORITY: Employer/Title queries (MOST SPECIFIC)
+                # =====================================================
                 if employer and title:
+                    # BEST QUERY: All three together
+                    career_queries.insert(0, f'"{donor_name}" "{employer}" "{title}"')
                     career_queries.append(f'"{donor_name}" {title} {employer}')
-                    log.info(f"  💼 Including employer+title in career queries: {title} at {employer}")
+                    log.info(f"  💼 PRIORITY CAREER QUERY: \"{donor_name}\" \"{employer}\" \"{title}\"")
+                    
+                    # For retired prospects, add former/retired variants
+                    if is_retired:
+                        career_queries.extend([
+                            f'"{donor_name}" former "{title}" "{employer}"',
+                            f'"{donor_name}" retired "{employer}"',
+                        ])
+                        log.info(f"  👴 Adding retired/former career queries")
                 elif employer:
                     career_queries.append(f'"{donor_name}" career {employer}')
+                    career_queries.append(f'"{donor_name}" "{employer}"')
+                    if is_retired:
+                        career_queries.append(f'"{donor_name}" retired "{employer}"')
                 elif title:
                     career_queries.append(f'"{donor_name}" {title}')
+                    if is_retired:
+                        career_queries.append(f'"{donor_name}" retired "{title}"')
+                
+                # RETIRED-SPECIFIC queries (if 75+ years old)
+                if is_retired:
+                    career_queries.extend([
+                        f'"{donor_name}" retired career history',
+                        f'"{donor_name}" former professional',
+                    ])
                 
                 # Standard career queries
                 career_queries.extend([
@@ -5368,12 +6203,40 @@ def main():
                 political_bullets, network_bullets
             )
             
+            # Check for hallucinations in IHS assessment
+            ihs_warnings = detect_hallucinations(ihs_assessment, "IHS Assessment")
+            if ihs_warnings:
+                log.warning("⚠️  HALLUCINATION WARNING in IHS Assessment:")
+                for warning in ihs_warnings:
+                    log.warning(f"  {warning}")
+            
             # 6.8) Generate Strategic Briefing
             strategic_briefing = generate_strategic_briefing(
                 donor_name, location_filter,
                 bio_bullets, career_bullets, philanthropy_bullets,
                 political_bullets, network_bullets
             )
+            
+            # Check for hallucinations in strategic briefing
+            strat_warnings = detect_hallucinations(strategic_briefing, "Strategic Briefing")
+            if strat_warnings:
+                log.warning("⚠️  HALLUCINATION WARNING in Strategic Briefing:")
+                for warning in strat_warnings:
+                    log.warning(f"  {warning}")
+                # If hallucinations detected, replace with safer text
+                if any("FABRICATED" in w or "LIKELY HALLUCINATION" in w for w in strat_warnings):
+                    log.warning("  🚨 Replacing hallucinated Strategic Briefing with factual disclaimer")
+                    strategic_briefing = f"""**Executive Summary for IHS Board Members: {donor_name}**
+
+Limited public information is available about {donor_name}. Based on available research:
+
+**Who They Are:** Research indicates {donor_name} resides in {location_filter}. Professional and career information is limited in public sources. Age and family connection data was found through public records databases.
+
+**Why IHS Should Engage:** Insufficient public information to assess alignment with IHS mission or giving capacity. No documented philanthropic history or political activity found.
+
+**Recommended Next Steps:** Additional research and personal outreach recommended before cultivation. Consider requesting more information from existing contacts or the prospect directly. Gift capacity and program alignment cannot be assessed without further information.
+
+[Note: This summary reflects limited available public data. Some research sources returned no relevant results for this prospect.]"""
             
             # 6.9) Generate Gift Officer Summary
             log.info("Generating Gift Officer Summary...")
